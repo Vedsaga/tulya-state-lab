@@ -4,6 +4,7 @@ use std::mem::size_of;
 use std::sync::{Arc, Weak};
 
 const CDC_WINDOW: usize = 64;
+const REPAIR_MAX_MULTIPLIER: usize = 4;
 
 #[derive(Clone, Copy)]
 struct ChunkRef {
@@ -77,11 +78,11 @@ impl CdcStore {
 
     /// Split using a 64-byte rolling buzhash-style fingerprint.
     ///
-    /// The fingerprint is *not* reset at chunk boundaries. Once an insertion or
-    /// deletion is more than one window behind us, the boundary predicate again
-    /// depends only on the local byte window. This is the locality property the
-    /// Phase-1 CDC adversary needs; the previous chunk-prefix hash could let a
-    /// small edit perturb the boundary phase through a large suffix.
+    /// The fingerprint is not reset at chunk boundaries. Once an insertion or
+    /// deletion is more than one window behind us, the fingerprint again
+    /// depends only on the local byte window. This lets an incremental edit
+    /// detect a common boundary with the unchanged old suffix and reuse all
+    /// chunks after that point.
     fn chunk_ranges(&self, bytes: &[u8]) -> Vec<(usize, usize)> {
         if bytes.is_empty() {
             return Vec::new();
@@ -147,12 +148,7 @@ impl CdcStore {
         id
     }
 
-    fn snapshot_from_bytes(&mut self, bytes: &[u8]) -> Snapshot {
-        let mut refs = Vec::new();
-        for (start, end) in self.chunk_ranges(bytes) {
-            let id = self.intern(&bytes[start..end]);
-            refs.push(ChunkRef { id, start });
-        }
+    fn finish_snapshot(&mut self, refs: Vec<ChunkRef>, len: usize) -> Snapshot {
         let chunks: Arc<[ChunkRef]> = Arc::from(refs.into_boxed_slice());
         let manifest_bytes = chunks.len().saturating_mul(size_of::<ChunkRef>());
         self.lifetime_metadata_bytes = self
@@ -162,10 +158,16 @@ impl CdcStore {
             weak: Arc::downgrade(&chunks),
             bytes: manifest_bytes,
         });
-        Snapshot {
-            chunks,
-            len: bytes.len(),
+        Snapshot { chunks, len }
+    }
+
+    fn snapshot_from_bytes(&mut self, bytes: &[u8]) -> Snapshot {
+        let mut refs = Vec::new();
+        for (start, end) in self.chunk_ranges(bytes) {
+            let id = self.intern(&bytes[start..end]);
+            refs.push(ChunkRef { id, start });
         }
+        self.finish_snapshot(refs, bytes.len())
     }
 
     fn first_chunk_for_offset(&self, snapshot: &Snapshot, offset: usize) -> usize {
@@ -183,13 +185,157 @@ impl CdcStore {
         }
         lo
     }
+
+    fn chunk_index_starting_at(&self, snapshot: &Snapshot, start: usize) -> Option<usize> {
+        snapshot
+            .chunks
+            .binary_search_by_key(&start, |entry| entry.start)
+            .ok()
+    }
+
+    fn rounded_scan_end(&self, snapshot: &Snapshot, target: usize) -> usize {
+        if target >= snapshot.len {
+            return snapshot.len;
+        }
+        let index = self.first_chunk_for_offset(snapshot, target);
+        if let Some(entry) = snapshot.chunks.get(index).copied() {
+            entry
+                .start
+                .saturating_add(self.chunks[entry.id].len())
+                .min(snapshot.len)
+        } else {
+            snapshot.len
+        }
+    }
+
+    /// Incrementally repair the chunking around one edit.
+    ///
+    /// We begin at an existing old chunk boundary at or before the edit, scan a
+    /// bounded unchanged suffix, and look for a newly generated natural chunk
+    /// boundary that maps exactly to an old suffix boundary. Once such a common
+    /// boundary is found, all later old chunk IDs can be reused directly. If a
+    /// bounded repair fails to resynchronize, correctness wins: we fall back to
+    /// canonical full-state re-chunking for that edit.
+    fn incremental_edit(
+        &mut self,
+        parent: &Snapshot,
+        edit: &Edit,
+    ) -> Result<Snapshot, StateError> {
+        edit.validate_len(parent.len)?;
+        let child_len = edit.output_len(parent.len)?;
+
+        if parent.chunks.is_empty() {
+            return Ok(self.snapshot_from_bytes(&edit.insert));
+        }
+
+        let old_edit_end = edit
+            .start
+            .checked_add(edit.delete_len)
+            .ok_or(StateError::LengthOverflow)?;
+        let new_edit_end = edit
+            .start
+            .checked_add(edit.insert.len())
+            .ok_or(StateError::LengthOverflow)?;
+
+        let mut anchor_index = self.first_chunk_for_offset(parent, edit.start);
+        if anchor_index >= parent.chunks.len() {
+            anchor_index = parent.chunks.len() - 1;
+        }
+        let anchor_start = parent.chunks[anchor_index].start;
+
+        let repair_budget = self
+            .max_chunk
+            .saturating_mul(REPAIR_MAX_MULTIPLIER)
+            .saturating_add(CDC_WINDOW);
+        let scan_target = old_edit_end.saturating_add(repair_budget).min(parent.len);
+        let scan_old_end = self.rounded_scan_end(parent, scan_target);
+
+        let old_local = self.read_range(parent, anchor_start, scan_old_end - anchor_start)?;
+        let local_edit = Edit {
+            start: edit.start - anchor_start,
+            delete_len: edit.delete_len,
+            insert: edit.insert.clone(),
+        };
+        let child_local = local_edit.apply(&old_local)?;
+        let ranges = self.chunk_ranges(&child_local);
+
+        let min_resync_new = new_edit_end.saturating_add(CDC_WINDOW);
+        let mut resync = None;
+
+        if scan_old_end < parent.len {
+            // The final range may exist only because the repair slice ended, so
+            // only earlier range ends are guaranteed natural CDC boundaries.
+            for (range_index, &(_, local_end)) in ranges
+                .iter()
+                .enumerate()
+                .take(ranges.len().saturating_sub(1))
+            {
+                let new_boundary = anchor_start.saturating_add(local_end);
+                if new_boundary < min_resync_new || new_boundary < new_edit_end {
+                    continue;
+                }
+                let suffix_distance = new_boundary - new_edit_end;
+                let old_boundary = old_edit_end.saturating_add(suffix_distance);
+                if old_boundary > scan_old_end {
+                    continue;
+                }
+                if let Some(suffix_index) = self.chunk_index_starting_at(parent, old_boundary) {
+                    resync = Some((range_index + 1, old_boundary, suffix_index));
+                    break;
+                }
+            }
+        }
+
+        if scan_old_end < parent.len && resync.is_none() {
+            let parent_bytes = self.read_all(parent)?;
+            let child = edit.apply(&parent_bytes)?;
+            return Ok(self.snapshot_from_bytes(&child));
+        }
+
+        let mut refs = Vec::with_capacity(parent.chunks.len().saturating_add(8));
+        refs.extend_from_slice(&parent.chunks[..anchor_index]);
+
+        match resync {
+            Some((middle_count, old_boundary, suffix_index)) => {
+                for &(start, end) in ranges.iter().take(middle_count) {
+                    let id = self.intern(&child_local[start..end]);
+                    refs.push(ChunkRef {
+                        id,
+                        start: anchor_start + start,
+                    });
+                }
+
+                debug_assert_eq!(parent.chunks[suffix_index].start, old_boundary);
+                for entry in parent.chunks[suffix_index..].iter().copied() {
+                    let suffix_distance = entry.start - old_edit_end;
+                    refs.push(ChunkRef {
+                        id: entry.id,
+                        start: new_edit_end + suffix_distance,
+                    });
+                }
+            }
+            None => {
+                // The repair slice reached EOF, so it already contains the full
+                // child suffix and there is nothing old left to append.
+                for &(start, end) in &ranges {
+                    let id = self.intern(&child_local[start..end]);
+                    refs.push(ChunkRef {
+                        id,
+                        start: anchor_start + start,
+                    });
+                }
+            }
+        }
+
+        Ok(self.finish_snapshot(refs, child_len))
+    }
 }
 
 impl Backend for CdcStore {
     type Snapshot = Snapshot;
 
     fn name(&self) -> &'static str {
-        "windowed-cdc-dedup"
+        "incremental-windowed-cdc"
     }
 
     fn create(&mut self, bytes: &[u8]) -> Self::Snapshot {
@@ -247,10 +393,7 @@ impl Backend for CdcStore {
         parent: &Self::Snapshot,
         edit: &Edit,
     ) -> Result<Self::Snapshot, StateError> {
-        edit.validate_len(parent.len)?;
-        let parent_bytes = self.read_all(parent)?;
-        let child = edit.apply(&parent_bytes)?;
-        Ok(self.snapshot_from_bytes(&child))
+        self.incremental_edit(parent, edit)
     }
 
     fn validate(&self, snapshot: &Self::Snapshot) -> Result<(), String> {
@@ -368,9 +511,39 @@ mod tests {
 
         assert_eq!(cdc.read_all(&child).unwrap(), expected);
         assert!(
-            after.saturating_sub(before) < 128 * 1024,
+            after.saturating_sub(before) < 64 * 1024,
             "localized edit created too much new chunk payload: {} bytes",
             after.saturating_sub(before)
         );
+    }
+
+    #[test]
+    fn repeated_historical_branching_stays_exact() {
+        let mut cdc = CdcStore::new(4096);
+        let base_bytes = deterministic_bytes(256 * 1024);
+        let base = cdc.create(&base_bytes);
+        let mut snapshots = vec![base];
+        let mut expected = vec![base_bytes];
+
+        for i in 0..128usize {
+            let parent = (i * 37) % snapshots.len();
+            let parent_len = expected[parent].len();
+            let start = (i * 7919) % (parent_len + 1);
+            let delete_len = (i % 31).min(parent_len - start);
+            let insert = vec![(i & 0xff) as u8; (i * 13) % 47];
+            let edit = Edit {
+                start,
+                delete_len,
+                insert,
+            };
+            let child_expected = edit.apply(&expected[parent]).unwrap();
+            let child = cdc.edit(&snapshots[parent], &edit).unwrap();
+            assert_eq!(cdc.read_all(&child).unwrap(), child_expected);
+            cdc.validate(&child).unwrap();
+            snapshots.push(child);
+            expected.push(child_expected);
+        }
+
+        assert_eq!(cdc.read_all(&snapshots[0]).unwrap(), expected[0]);
     }
 }
