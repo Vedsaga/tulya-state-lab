@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use std::mem::size_of;
 use std::sync::{Arc, Weak};
 
+const CDC_WINDOW: usize = 64;
+
 #[derive(Clone, Copy)]
 struct ChunkRef {
     id: usize,
@@ -73,23 +75,47 @@ impl CdcStore {
         hash
     }
 
+    /// Split using a 64-byte rolling buzhash-style fingerprint.
+    ///
+    /// The fingerprint is *not* reset at chunk boundaries. Once an insertion or
+    /// deletion is more than one window behind us, the boundary predicate again
+    /// depends only on the local byte window. This is the locality property the
+    /// Phase-1 CDC adversary needs; the previous chunk-prefix hash could let a
+    /// small edit perturb the boundary phase through a large suffix.
     fn chunk_ranges(&self, bytes: &[u8]) -> Vec<(usize, usize)> {
         if bytes.is_empty() {
             return Vec::new();
         }
+
         let mut ranges = Vec::new();
         let mut start = 0usize;
         let mut hash = 0u64;
+        let mut window = [0u8; CDC_WINDOW];
+        let mut filled = 0usize;
+        let outgoing_rotation = (CDC_WINDOW % u64::BITS as usize) as u32;
 
         for (i, &byte) in bytes.iter().enumerate() {
-            hash = hash.rotate_left(1).wrapping_add(Self::gear(byte));
+            if filled < CDC_WINDOW {
+                window[filled] = byte;
+                filled += 1;
+                hash = hash.rotate_left(1) ^ Self::gear(byte);
+            } else {
+                let slot = i % CDC_WINDOW;
+                let outgoing = window[slot];
+                window[slot] = byte;
+                hash = hash.rotate_left(1)
+                    ^ Self::gear(byte)
+                    ^ Self::gear(outgoing).rotate_left(outgoing_rotation);
+            }
+
             let chunk_len = i + 1 - start;
+            let fingerprint_boundary =
+                filled == CDC_WINDOW && (hash & self.boundary_mask) == 0;
             let boundary = chunk_len >= self.min_chunk
-                && ((hash & self.boundary_mask) == 0 || chunk_len >= self.max_chunk);
+                && (fingerprint_boundary || chunk_len >= self.max_chunk);
             if boundary {
                 ranges.push((start, i + 1));
                 start = i + 1;
-                hash = 0;
             }
         }
         if start < bytes.len() {
@@ -163,7 +189,7 @@ impl Backend for CdcStore {
     type Snapshot = Snapshot;
 
     fn name(&self) -> &'static str {
-        "simple-cdc-dedup"
+        "windowed-cdc-dedup"
     }
 
     fn create(&mut self, bytes: &[u8]) -> Self::Snapshot {
@@ -282,6 +308,18 @@ impl Backend for CdcStore {
 mod tests {
     use super::*;
 
+    fn deterministic_bytes(len: usize) -> Vec<u8> {
+        let mut x = 0x1234_5678_9abc_def0u64;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect()
+    }
+
     #[test]
     fn shifted_insert_is_exact_and_parent_is_unchanged() {
         let mut cdc = CdcStore::new(128);
@@ -311,5 +349,28 @@ mod tests {
         let after = cdc.stats().retained_payload_bytes;
         assert_eq!(before, after);
         assert_eq!(cdc.read_all(&first).unwrap(), cdc.read_all(&second).unwrap());
+    }
+
+    #[test]
+    fn small_insert_resynchronizes_and_reuses_most_payload() {
+        let mut cdc = CdcStore::new(4096);
+        let bytes = deterministic_bytes(1024 * 1024);
+        let base = cdc.create(&bytes);
+        let before = cdc.stats().retained_payload_bytes;
+        let edit = Edit {
+            start: 128 * 1024 + 17,
+            delete_len: 0,
+            insert: b"localized insertion".to_vec(),
+        };
+        let expected = edit.apply(&bytes).unwrap();
+        let child = cdc.edit(&base, &edit).unwrap();
+        let after = cdc.stats().retained_payload_bytes;
+
+        assert_eq!(cdc.read_all(&child).unwrap(), expected);
+        assert!(
+            after.saturating_sub(before) < 128 * 1024,
+            "localized edit created too much new chunk payload: {} bytes",
+            after.saturating_sub(before)
+        );
     }
 }
