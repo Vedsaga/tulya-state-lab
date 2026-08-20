@@ -29,17 +29,17 @@ The harness reports:
 - retained payload bytes;
 - retained explicit metadata bytes;
 - retained growth per branch;
-- lifetime allocation/write amplification per branch;
+- lifetime **representation** allocation per branch;
 - live versus lifetime-allocated structural objects;
 - a read checksum plus sampled cross-backend semantic equality.
 
-Storage numbers are **estimates**, not RSS or filesystem bytes. They count payload plus explicit nodes/manifests. Allocator control blocks, hash-table bucket capacity, and process/runtime overhead are excluded. This limitation applies to both backends and is printed by the benchmark.
+Storage numbers are **estimates**, not RSS or filesystem bytes. They count payload plus explicit nodes/manifests. Allocator control blocks, hash-table bucket capacity, process/runtime overhead, and temporary buffers used while reading/re-chunking are excluded. The lifetime-allocation metric therefore measures allocations retained by or created for the representation itself; it is not a full heap-allocation or physical-write-amplification measurement. This limitation applies to both backends and is printed by the benchmark.
 
 ## Kill rule
 
 A representation is not interesting merely because it is elegant, persistent, compressed, or formally provable.
 
-Do not promote the AVL design into a production engine merely because it beats the deliberately simple CDC implementation on edit CPU. The useful signal is a **large combined advantage** on branch-heavy workloads after retained metadata, write amplification, historical range reads, and realistic state shapes are counted.
+Do not promote the AVL design into a production engine merely because it beats the deliberately simple CDC implementation on edit CPU. The useful signal is a **large combined advantage** on branch-heavy workloads after retained metadata, representation allocation, historical range reads, and realistic state shapes are counted.
 
 If the AVL rope is close to CDC on retained growth, or if its storage win is purchased with materially worse reads/metadata, it is only a baseline. If a later incremental CDC/COW implementation comes within roughly 20–25% of the winning design on the intended workload with much less complexity, prefer the simpler design.
 
