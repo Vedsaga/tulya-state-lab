@@ -1,0 +1,16 @@
+[package]
+name = "tulya-state-lab"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "tulya_state_lab"
+path = "src/lib.rs"
+
+[[bin]]
+name = "state-lab"
+path = "src/main.rs"
+
+[profile.release]
+debug = true
