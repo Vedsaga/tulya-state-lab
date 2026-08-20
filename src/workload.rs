@@ -96,7 +96,8 @@ fn structured_base(len: usize, seed: u64) -> Vec<u8> {
         let within_page = i % 4096;
         if within_page < 64 {
             let page = i / 4096;
-            *byte = ((page.rotate_left(within_page % usize::BITS as usize) ^ within_page) & 0xff) as u8;
+            let shift = (within_page % usize::BITS as usize) as u32;
+            *byte = ((page.rotate_left(shift) ^ within_page) & 0xff) as u8;
         } else if within_page < 3072 {
             *byte = TEMPLATE[i % TEMPLATE.len()];
         } else {
