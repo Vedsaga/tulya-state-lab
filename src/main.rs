@@ -2,6 +2,7 @@ use std::env;
 use std::process::ExitCode;
 use tulya_state_lab::avl::AvlRope;
 use tulya_state_lab::cdc::CdcStore;
+use tulya_state_lab::piece_cow::PieceCow;
 use tulya_state_lab::workload::{run_backend, verify_pair, Config, Report, Workload};
 
 #[derive(Clone, Debug)]
@@ -29,7 +30,7 @@ fn usage() -> &'static str {
        --base-kib N          base state size in KiB (overrides --base-mib)\n\
        --edit-bytes N        maximum inserted/deleted bytes per edit (default 96)\n\
        --read-bytes N        range-read bytes per child (default 4096)\n\
-       --leaf-bytes N        AVL rope leaf size (default 4096)\n\
+       --leaf-bytes N        AVL/COW rope leaf size (default 4096)\n\
        --avg-chunk-bytes N   CDC target average chunk size (default 4096)\n\
        --verify-samples N    full cross-backend samples (default 16)\n\
        --seed N              deterministic u64 seed (decimal or 0xHEX)\n\
@@ -105,10 +106,16 @@ fn mib(bytes: usize) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
 
+fn retained_growth(report: &Report) -> usize {
+    report
+        .final_stats
+        .retained_bytes()
+        .saturating_sub(report.initial_stats.retained_bytes())
+}
+
 fn print_report(report: &Report, branches: usize) {
-    let initial_retained = report.initial_stats.retained_bytes();
     let final_retained = report.final_stats.retained_bytes();
-    let retained_growth = final_retained.saturating_sub(initial_retained);
+    let retained_growth = retained_growth(report);
     let initial_lifetime = report.initial_stats.lifetime_allocated_bytes();
     let final_lifetime = report.final_stats.lifetime_allocated_bytes();
     let lifetime_growth = final_lifetime.saturating_sub(initial_lifetime);
@@ -152,6 +159,27 @@ fn print_report(report: &Report, branches: usize) {
     println!("  checksum: {:016x}", report.checksum);
 }
 
+fn compare_reports(left: &Report, right: &Report) {
+    let left_growth = retained_growth(left);
+    let right_growth = retained_growth(right);
+    println!("  {} vs {}", left.backend, right.backend);
+    println!("    retained growth: {} vs {} bytes", left_growth, right_growth);
+    if right_growth > 0 {
+        println!(
+            "    retained-growth ratio: {:.3}x",
+            left_growth as f64 / right_growth as f64
+        );
+    }
+    println!(
+        "    edit p95 ratio: {:.3}x",
+        left.edit.p95_ns as f64 / right.edit.p95_ns.max(1) as f64
+    );
+    println!(
+        "    read p95 ratio: {:.3}x",
+        left.read.p95_ns as f64 / right.read.p95_ns.max(1) as f64
+    );
+}
+
 fn run() -> Result<(), String> {
     let cli = parse_cli()?;
     println!("tulya-state-lab phase 1");
@@ -173,41 +201,27 @@ fn run() -> Result<(), String> {
         workload.logical_version_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
     );
 
-    println!("\nrunning persistent AVL rope...");
+    println!("\nrunning persistent AVL byte rope...");
     let avl = run_backend(AvlRope::new(cli.leaf_bytes), &workload).map_err(|e| e.to_string())?;
     print_report(&avl.report, cli.config.branches);
 
-    println!("\nrunning simple CDC dedup...");
+    println!("\nrunning persistent COW piece rope...");
+    let cow = run_backend(PieceCow::new(cli.leaf_bytes), &workload).map_err(|e| e.to_string())?;
+    print_report(&cow.report, cli.config.branches);
+
+    println!("\nrunning incremental windowed CDC...");
     let cdc = run_backend(CdcStore::new(cli.avg_chunk_bytes), &workload).map_err(|e| e.to_string())?;
     print_report(&cdc.report, cli.config.branches);
 
-    println!("\nverifying sampled versions across backends...");
-    verify_pair(&avl, &cdc, &workload)?;
-    println!("semantic cross-check: PASS");
+    println!("\nverifying sampled versions across all backends...");
+    verify_pair(&avl, &cow, &workload)?;
+    verify_pair(&cow, &cdc, &workload)?;
+    println!("semantic cross-check: PASS (3 backends)");
 
-    let avl_growth = avl
-        .report
-        .final_stats
-        .retained_bytes()
-        .saturating_sub(avl.report.initial_stats.retained_bytes());
-    let cdc_growth = cdc
-        .report
-        .final_stats
-        .retained_bytes()
-        .saturating_sub(cdc.report.initial_stats.retained_bytes());
-    println!("\ncomparison (lower is better; estimates exclude allocator/hash-table overhead):");
-    println!("  retained growth: AVL={} bytes, CDC={} bytes", avl_growth, cdc_growth);
-    if cdc_growth > 0 {
-        println!("  AVL/CDC retained-growth ratio: {:.3}x", avl_growth as f64 / cdc_growth as f64);
-    }
-    println!(
-        "  edit p95 ratio AVL/CDC: {:.3}x",
-        avl.report.edit.p95_ns as f64 / cdc.report.edit.p95_ns.max(1) as f64
-    );
-    println!(
-        "  read p95 ratio AVL/CDC: {:.3}x",
-        avl.report.read.p95_ns as f64 / cdc.report.read.p95_ns.max(1) as f64
-    );
+    println!("\ncomparison (left/right; lower is better; storage estimates exclude allocator/hash-table overhead):");
+    compare_reports(&avl.report, &cow.report);
+    compare_reports(&cow.report, &cdc.report);
+    compare_reports(&avl.report, &cdc.report);
     println!("\nNo representation is promoted by this program; interpret the numbers against the README kill criteria.");
     Ok(())
 }
