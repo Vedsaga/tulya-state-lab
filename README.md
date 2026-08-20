@@ -13,11 +13,15 @@ The lab exists to answer one question:
 The first experiment compares two deliberately different adversaries under the same deterministic branch/edit/read plan:
 
 - **persistent AVL rope** — immutable `Arc` nodes, path-copying split/join, AVL rebalancing, chunked leaves, direct range traversal;
-- **simple CDC dedup** — rolling-hash content-defined chunks, exact-byte collision verification, deduplicated payload storage, per-version manifests with binary-searched range reads. Edits intentionally reconstruct and re-chunk the parent state, making this a simple storage adversary rather than an optimized dynamic CDC implementation.
+- **windowed CDC dedup** — a fixed-window rolling buzhash-style content-defined chunker, exact-byte collision verification, deduplicated payload storage, and per-version manifests with binary-searched range reads. Boundary fingerprints are not reset at chunk boundaries, so insert/delete edits can resynchronize after a local window instead of perturbing the chunk phase through a large suffix. Edits still reconstruct and re-chunk the parent state, making this a storage/locality adversary rather than an optimized dynamic CDC implementation.
 
 Every generated child chooses an arbitrary historical parent. Both backends must retain all version handles. Sampled versions are fully decoded and compared byte-for-byte after timing.
 
 The repository intentionally excludes durability/WAL, networking, auth, crypto, framework integrations, production APIs, and Lean↔Rust refinement. Those only become relevant if a representation survives the benchmark.
+
+### Quarantined pre-windowed results
+
+Results produced before commit `2f4147cdc95b6e3347b10983a9f846990b7d2684` used a weaker chunk-prefix fingerprint that reset at every chunk boundary. Those runs are useful as implementation diagnostics but **must not be used as evidence that AVL beats a strong CDC baseline**, because a small insertion/deletion could perturb boundary phase far into the suffix. Re-run the same workload at or after that commit for the novelty decision.
 
 ## What is measured
 
@@ -39,9 +43,9 @@ Storage numbers are **estimates**, not RSS or filesystem bytes. They count paylo
 
 A representation is not interesting merely because it is elegant, persistent, compressed, or formally provable.
 
-Do not promote the AVL design into a production engine merely because it beats the deliberately simple CDC implementation on edit CPU. The useful signal is a **large combined advantage** on branch-heavy workloads after retained metadata, representation allocation, historical range reads, and realistic state shapes are counted.
+Do not promote the AVL design into a production engine merely because it beats the deliberately non-incremental CDC implementation on edit CPU. The useful signal is a **large combined advantage** on branch-heavy workloads after retained metadata, representation allocation, historical range reads, and realistic state shapes are counted.
 
-If the AVL rope is close to CDC on retained growth, or if its storage win is purchased with materially worse reads/metadata, it is only a baseline. If a later incremental CDC/COW implementation comes within roughly 20–25% of the winning design on the intended workload with much less complexity, prefer the simpler design.
+If the AVL rope is close to windowed CDC on retained growth, or if its storage win is purchased with materially worse reads/metadata, it is only a baseline. If a later incremental CDC/COW implementation comes within roughly 20–25% of the winning design on the intended workload with much less complexity, prefer the simpler design.
 
 ## Run locally
 
@@ -65,7 +69,7 @@ cargo run --release -- \
   --verify-samples 32
 ```
 
-The simple CDC backend currently scans/re-chunks the full parent on each edit, so the 10k × 8 MiB run is intentionally expensive. Do not interpret that CPU gap as product novelty; retained growth and read behavior are the more useful Phase-1 signals for deciding what to prototype next.
+The windowed CDC backend currently scans/re-chunks the full parent on each edit, so the 10k × 8 MiB run is intentionally expensive. Do not interpret that CPU gap as product novelty; retained growth and read behavior are the more useful Phase-1 signals for deciding what to prototype next.
 
 Use `cargo run --release -- --help` for all options.
 
