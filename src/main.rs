@@ -142,7 +142,7 @@ fn print_report(report: &Report, branches: usize) {
         retained_growth as f64 / denom
     );
     println!(
-        "  lifetime_alloc_bytes_per_branch_est: {:.1}",
+        "  lifetime_repr_alloc_bytes_per_branch_est: {:.1}",
         lifetime_growth as f64 / denom
     );
     println!(
