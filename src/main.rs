@@ -299,6 +299,11 @@ fn run_corpus(cli: &Cli, manifest: &PathBuf) -> Result<(), String> {
         corpus.logical_bytes,
         corpus.logical_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
     );
+    println!(
+        "derived exact edit hunks: {} ({:.2} per case)",
+        corpus.edit_hunks(),
+        corpus.edit_hunks() as f64 / corpus.cases.len().max(1) as f64
+    );
 
     println!("\nrunning persistent AVL byte rope...");
     let avl = run_corpus_backend(
@@ -336,7 +341,7 @@ fn run_corpus(cli: &Cli, manifest: &PathBuf) -> Result<(), String> {
     compare_corpus_reports(&avl.report, &cow.report);
     compare_corpus_reports(&cow.report, &cdc.report);
     compare_corpus_reports(&avl.report, &cdc.report);
-    println!("\nThis corpus path uses one exact contiguous replacement per base/child pair; interpret multi-file patches as a conservative snapshot-diff gate.");
+    println!("\nRepository packs use file-aware exact edit scripts; unknown snapshot formats fall back to one contiguous replacement. Only final child snapshots are intentionally retained. The current CDC prototype does not reclaim transient chunks created by multi-hunk scripts, so treat a narrow CDC storage loss conservatively.");
     Ok(())
 }
 
