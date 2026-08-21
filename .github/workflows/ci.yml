@@ -13,6 +13,15 @@ jobs:
         run: rustup default stable
       - name: Test
         run: cargo test --all-targets
+      - name: Check trace preparer syntax
+        run: python3 -m py_compile scripts/prepare_swebench_verified.py
+      - name: Smoke real corpus mode
+        run: |
+          mkdir -p target/corpus-smoke
+          printf 'alpha OLD tail' > target/corpus-smoke/base.bin
+          printf 'alpha NEW longer tail' > target/corpus-smoke/child.bin
+          printf 'smoke\tbase.bin\tchild.bin\n' > target/corpus-smoke/manifest.tsv
+          cargo run --release -- --corpus-manifest target/corpus-smoke/manifest.tsv --verify-samples 2
       - name: Smoke small-edit
         run: cargo run --release -- --workload small-edit --branches 32 --base-kib 64 --edit-bytes 64 --verify-samples 8
       - name: Smoke append-heavy
