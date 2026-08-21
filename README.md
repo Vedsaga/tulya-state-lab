@@ -76,7 +76,7 @@ Hashing unique 64 KiB payloads costs CPU relative to plain COW, but even here in
 
 ## Phase 3 — real snapshot corpus
 
-The harness now accepts real independent `(base snapshot, child snapshot)` pairs through a tab-separated manifest:
+The harness accepts real independent `(base snapshot, child snapshot)` pairs through a tab-separated manifest:
 
 ```text
 case_id<TAB>base_snapshot_path<TAB>child_snapshot_path
@@ -88,37 +88,50 @@ All base snapshots are loaded first. The harness records retained base storage, 
 
 That representation is byte-exact but conservative for patches touching multiple distant files: the replacement spans from the first changed byte to the last changed byte. Treat this as a snapshot-diff gate, not as a claim that it captures an optimal multi-edit script.
 
-Run an already-prepared corpus with:
-
-```bash
-cargo run --release -- \
-  --corpus-manifest traces/example/manifest.tsv \
-  --verify-samples 16
-```
-
-The report includes total base-build time, child edit/read percentiles, base retained storage, final retained storage, child growth per case, representation allocation per case, checksum, and sampled byte-exact semantic verification across all three backends.
+The real-corpus path runs backends sequentially and retains only sampled decoded children for cross-backend verification, so validation memory is bounded relative to the corpus size.
 
 ## First external gate: SWE-bench Verified
 
 `scripts/prepare_swebench_verified.py` prepares real repository snapshots from SWE-bench Verified using only Python's standard library and Git. It fetches dataset rows, checks out each `base_commit`, applies the gold source patch, and packs tracked repository entries deterministically. `.git`, build products, and environment state are excluded.
 
-Start with 20 instances rather than all 500:
+### Preliminary 20-case result — real but not diverse
+
+The first 20 sequential dataset rows all came from `astropy/astropy`, so this is a real-repository result but **not** a representative SWE-bench-wide sample.
+
+All three backends reconstructed the sampled children byte-for-byte. On child-version growth:
+
+| backend | child growth / case | edit p95 | read p95 |
+| --- | ---: | ---: | ---: |
+| persistent AVL byte rope | 93,025.8 B | **42.601 us** | 3.657 us |
+| persistent COW + exact interning | **89,759.1 B** | 73.509 us | 2.685 us |
+| incremental windowed CDC | 121,881.6 B | 541.396 us | **1.603 us** |
+
+For this Astropy-only sample, COW used about **26% less new child storage** than CDC and had about **7.4x lower p95 edit latency**. That supports COW for incremental branch/checkpoint growth, but the sample is too narrow to generalize.
+
+There is a separate cold/global-storage signal: retained base storage was about **672 MiB for COW versus 117 MiB for CDC**. These bases are nearby revisions of one repository, so CDC's cross-snapshot chunk deduplication is strongly favored. Keep this metric separate from child growth; the next diverse sample is intended to test whether that advantage survives across repositories.
+
+### Repository-diverse sample
+
+The preparer now supports deterministic repository round-robin selection. It preserves dataset order within each repository, but interleaves repositories before taking the requested limit.
+
+Use a new output directory so the preliminary Astropy-only corpus stays reproducible:
 
 ```bash
 python3 scripts/prepare_swebench_verified.py \
-  --limit 20 \
-  --out traces/swebench-verified
+  --selection repo-round-robin \
+  --limit 24 \
+  --out traces/swebench-verified-diverse
 
 cargo test --all-targets
 
 cargo run --release -- \
-  --corpus-manifest traces/swebench-verified/manifest.tsv \
+  --corpus-manifest traces/swebench-verified-diverse/manifest.tsv \
   --verify-samples 16
 ```
 
-The preparer caches cloned repositories under `.trace-cache/swebench-verified` by default. Both `.trace-cache/` and `traces/` are ignored by Git.
+The script prints the number and names of selected repositories before cloning/preparing cases. Repository clones are cached under `.trace-cache/swebench-verified`, so any already-fetched repositories can be reused.
 
-Do not scale to all 500 instances until the first 20 cases compile, prepare, run, and make semantic sense.
+Do not scale to all 500 instances yet. The next decision should be based on whether the ranking and the cold-base-storage signal survive repository diversity.
 
 ## What is measured
 
