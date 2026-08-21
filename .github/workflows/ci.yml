@@ -15,8 +15,8 @@ jobs:
         run: cargo test --all-targets
       - name: Check trace preparer syntax
         run: python3 -m py_compile scripts/prepare_swebench_verified.py
-      - name: Check LangGraph benchmark syntax
-        run: python3 -m py_compile benchmarks/langgraph/bench_postgres.py benchmarks/langgraph/bench_postgres_fixed.py
+      - name: Check benchmark syntax
+        run: python3 -m py_compile benchmarks/langgraph/bench_postgres.py benchmarks/langgraph/bench_postgres_fixed.py benchmarks/storage_floor/bench_corpus.py
       - name: Smoke real corpus mode
         run: |
           mkdir -p target/corpus-smoke
