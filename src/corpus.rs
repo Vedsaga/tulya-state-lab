@@ -1,15 +1,19 @@
 use crate::model::{Backend, BackendStats, Edit, StateError};
 use crate::workload::LatencySummary;
+use std::cmp::Ordering;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+
+const PACK_MAGIC: &[u8] = b"TULYA_REPO_PACK_V1\0";
+const PACK_ENTRY_HEADER_BYTES: usize = 1 + 4 + 4 + 8;
 
 #[derive(Clone, Debug)]
 pub struct CorpusCase {
     pub id: String,
     pub base: Vec<u8>,
     pub child_len: usize,
-    pub edit: Edit,
+    pub edits: Vec<Edit>,
     pub read_start: usize,
     pub read_len: usize,
 }
@@ -30,6 +34,7 @@ pub struct CorpusReport {
     pub final_stats: BackendStats,
     pub checksum: u64,
     pub cases: usize,
+    pub edit_hunks: usize,
     pub logical_bytes: u128,
 }
 
@@ -40,7 +45,57 @@ pub struct CorpusOutcome {
     pub sample_children: Vec<Vec<u8>>,
 }
 
-fn derive_edit(base: &[u8], child: &[u8]) -> Edit {
+#[derive(Clone, Debug)]
+struct PackedEntry {
+    path: Vec<u8>,
+    start: usize,
+    end: usize,
+}
+
+fn read_u32_le(bytes: &[u8], start: usize) -> Option<u32> {
+    let raw: [u8; 4] = bytes.get(start..start.checked_add(4)?)?.try_into().ok()?;
+    Some(u32::from_le_bytes(raw))
+}
+
+fn read_u64_le(bytes: &[u8], start: usize) -> Option<u64> {
+    let raw: [u8; 8] = bytes.get(start..start.checked_add(8)?)?.try_into().ok()?;
+    Some(u64::from_le_bytes(raw))
+}
+
+fn parse_pack(bytes: &[u8]) -> Option<Vec<PackedEntry>> {
+    if !bytes.starts_with(PACK_MAGIC) {
+        return None;
+    }
+    let mut cursor = PACK_MAGIC.len();
+    let count = usize::try_from(read_u64_le(bytes, cursor)?).ok()?;
+    cursor = cursor.checked_add(8)?;
+    let mut entries = Vec::with_capacity(count);
+
+    for _ in 0..count {
+        let start = cursor;
+        let header_end = cursor.checked_add(PACK_ENTRY_HEADER_BYTES)?;
+        bytes.get(cursor..header_end)?;
+        let path_len = usize::try_from(read_u32_le(bytes, cursor + 5)?).ok()?;
+        let content_len = usize::try_from(read_u64_le(bytes, cursor + 9)?).ok()?;
+        cursor = header_end;
+        let path_end = cursor.checked_add(path_len)?;
+        let path = bytes.get(cursor..path_end)?.to_vec();
+        let end = path_end.checked_add(content_len)?;
+        bytes.get(path_end..end)?;
+        entries.push(PackedEntry { path, start, end });
+        cursor = end;
+    }
+
+    if cursor != bytes.len() {
+        return None;
+    }
+    Some(entries)
+}
+
+fn derive_local_edit(base: &[u8], child: &[u8], base_offset: usize) -> Option<Edit> {
+    if base == child {
+        return None;
+    }
     let common_limit = base.len().min(child.len());
     let mut prefix = 0usize;
     while prefix < common_limit && base[prefix] == child[prefix] {
@@ -57,11 +112,138 @@ fn derive_edit(base: &[u8], child: &[u8]) -> Edit {
         suffix += 1;
     }
 
-    Edit {
-        start: prefix,
+    Some(Edit {
+        start: base_offset + prefix,
         delete_len: base.len() - prefix - suffix,
         insert: child[prefix..child.len() - suffix].to_vec(),
+    })
+}
+
+fn pack_entries_start() -> usize {
+    PACK_MAGIC.len() + 8
+}
+
+fn derive_pack_edits(base: &[u8], child: &[u8]) -> Option<Vec<Edit>> {
+    let base_entries = parse_pack(base)?;
+    let child_entries = parse_pack(child)?;
+    let entries_start = pack_entries_start();
+    if base.len() < entries_start || child.len() < entries_start {
+        return None;
     }
+
+    let mut common = Vec::new();
+    let (mut bi, mut ci) = (0usize, 0usize);
+    while bi < base_entries.len() && ci < child_entries.len() {
+        match base_entries[bi].path.cmp(&child_entries[ci].path) {
+            Ordering::Less => bi += 1,
+            Ordering::Greater => ci += 1,
+            Ordering::Equal => {
+                common.push((bi, ci));
+                bi += 1;
+                ci += 1;
+            }
+        }
+    }
+
+    let mut edits = Vec::new();
+    if let Some(edit) = derive_local_edit(
+        &base[PACK_MAGIC.len()..entries_start],
+        &child[PACK_MAGIC.len()..entries_start],
+        PACK_MAGIC.len(),
+    ) {
+        edits.push(edit);
+    }
+
+    let mut prev_b = 0usize;
+    let mut prev_c = 0usize;
+    for &(common_b, common_c) in &common {
+        if prev_b < common_b || prev_c < common_c {
+            let base_start = if prev_b < base_entries.len() {
+                base_entries[prev_b].start
+            } else {
+                base.len()
+            };
+            let base_end = if prev_b < common_b {
+                base_entries[common_b - 1].end
+            } else {
+                base_start
+            };
+            let child_start = if prev_c < child_entries.len() {
+                child_entries[prev_c].start
+            } else {
+                child.len()
+            };
+            let child_end = if prev_c < common_c {
+                child_entries[common_c - 1].end
+            } else {
+                child_start
+            };
+            edits.push(Edit {
+                start: base_start,
+                delete_len: base_end - base_start,
+                insert: child[child_start..child_end].to_vec(),
+            });
+        }
+
+        let base_entry = &base_entries[common_b];
+        let child_entry = &child_entries[common_c];
+        if let Some(edit) = derive_local_edit(
+            &base[base_entry.start..base_entry.end],
+            &child[child_entry.start..child_entry.end],
+            base_entry.start,
+        ) {
+            edits.push(edit);
+        }
+        prev_b = common_b + 1;
+        prev_c = common_c + 1;
+    }
+
+    if prev_b < base_entries.len() || prev_c < child_entries.len() {
+        let base_start = if prev_b < base_entries.len() {
+            base_entries[prev_b].start
+        } else {
+            base.len()
+        };
+        let base_end = base_entries.last().map_or(base_start, |entry| entry.end);
+        let child_start = if prev_c < child_entries.len() {
+            child_entries[prev_c].start
+        } else {
+            child.len()
+        };
+        let child_end = child_entries.last().map_or(child_start, |entry| entry.end);
+        edits.push(Edit {
+            start: base_start,
+            delete_len: base_end - base_start,
+            insert: child[child_start..child_end].to_vec(),
+        });
+    }
+
+    // Every edit is expressed in coordinates of the original base. Applying
+    // high offsets first keeps all remaining lower offsets valid. At an equal
+    // offset, replacements/deletions must happen before a pure insertion so an
+    // inserted run remains before the modified entry that originally followed it.
+    edits.sort_by(|left, right| {
+        right
+            .start
+            .cmp(&left.start)
+            .then_with(|| right.delete_len.cmp(&left.delete_len))
+    });
+    Some(edits)
+}
+
+fn derive_edits(base: &[u8], child: &[u8]) -> Vec<Edit> {
+    if let Some(edits) = derive_pack_edits(base, child) {
+        return edits;
+    }
+    derive_local_edit(base, child, 0).into_iter().collect()
+}
+
+fn apply_edits(base: &[u8], edits: &[Edit]) -> Result<Vec<u8>, StateError> {
+    let mut bytes = base.to_vec();
+    for edit in edits {
+        bytes = edit.apply(&bytes)?;
+    }
+    Ok(bytes)
 }
 
 fn checksum_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
@@ -104,6 +286,9 @@ impl Corpus {
     /// `case_id<TAB>base_snapshot_path<TAB>child_snapshot_path`
     ///
     /// Extra columns are ignored so dataset metadata can travel with the trace.
+    /// Repository packs produced by `prepare_swebench_verified.py` are diffed
+    /// file-by-file; unknown binary snapshot formats fall back to one exact
+    /// longest-prefix/suffix contiguous replacement.
     pub fn load_manifest(path: &Path, read_bytes: usize) -> Result<Self, String> {
         let text = fs::read_to_string(path)
             .map_err(|e| format!("failed to read corpus manifest {}: {e}", path.display()))?;
@@ -139,12 +324,11 @@ impl Corpus {
                 )
             })?;
             let child_len = child.len();
-            let edit = derive_edit(&base, &child);
-            let rebuilt = edit
-                .apply(&base)
-                .map_err(|e| format!("derived edit for {id} is invalid: {e}"))?;
+            let edits = derive_edits(&base, &child);
+            let rebuilt = apply_edits(&base, &edits)
+                .map_err(|e| format!("derived edit script for {id} is invalid: {e}"))?;
             if rebuilt != child {
-                return Err(format!("derived edit for {id} does not reconstruct child"));
+                return Err(format!("derived edit script for {id} does not reconstruct child"));
             }
 
             let read_len = read_bytes.min(child_len);
@@ -160,7 +344,7 @@ impl Corpus {
                 id,
                 base,
                 child_len,
-                edit,
+                edits,
                 read_start,
                 read_len,
             });
@@ -173,6 +357,10 @@ impl Corpus {
             cases,
             logical_bytes,
         })
+    }
+
+    pub fn edit_hunks(&self) -> usize {
+        self.cases.iter().map(|case| case.edits.len()).sum()
     }
 }
 
@@ -217,10 +405,13 @@ pub fn run_corpus_backend<B: Backend>(
 
     for (case, base) in corpus.cases.iter().zip(&bases) {
         let edit_start = Instant::now();
-        let child = backend.edit(base, &case.edit)?;
+        let mut child = base.clone();
+        for edit in &case.edits {
+            child = backend.edit(&child, edit)?;
+        }
         edit_latencies.push(edit_start.elapsed().as_nanos().min(u64::MAX as u128) as u64);
         if backend.len(&child) != case.child_len {
-            return Err(StateError::Corrupt("corpus edit produced wrong child length"));
+            return Err(StateError::Corrupt("corpus edit script produced wrong child length"));
         }
 
         let read_start = Instant::now();
@@ -249,6 +440,7 @@ pub fn run_corpus_backend<B: Backend>(
         final_stats,
         checksum,
         cases: corpus.cases.len(),
+        edit_hunks: corpus.edit_hunks(),
         logical_bytes: corpus.logical_bytes,
     };
     Ok(CorpusOutcome {
@@ -272,9 +464,7 @@ pub fn verify_corpus_outcomes(
 
     for (sample_pos, &index) in left.sample_indices.iter().enumerate() {
         let case = &corpus.cases[index];
-        let expected = case
-            .edit
-            .apply(&case.base)
+        let expected = apply_edits(&case.base, &case.edits)
             .map_err(|e| format!("failed to reconstruct expected child {}: {e}", case.id))?;
         let left_bytes = &left.sample_children[sample_pos];
         let right_bytes = &right.sample_children[sample_pos];
@@ -289,20 +479,63 @@ pub fn verify_corpus_outcomes(
 mod tests {
     use super::*;
 
-    #[test]
-    fn contiguous_edit_reconstructs_arbitrary_pair() {
-        let base = b"alpha-OLD-middle-tail";
-        let child = b"alpha-NEW-and-longer-middle-tail";
-        let edit = derive_edit(base, child);
-        assert_eq!(edit.apply(base).unwrap(), child);
+    fn pack(entries: &[(&[u8], &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(PACK_MAGIC);
+        out.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+        for &(path, content) in entries {
+            out.push(1);
+            out.extend_from_slice(&0o100644u32.to_le_bytes());
+            out.extend_from_slice(&(path.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(content.len() as u64).to_le_bytes());
+            out.extend_from_slice(path);
+            out.extend_from_slice(content);
+        }
+        out
     }
 
     #[test]
-    fn contiguous_edit_handles_identical_inputs() {
+    fn contiguous_fallback_reconstructs_arbitrary_pair() {
+        let base = b"alpha-OLD-middle-tail";
+        let child = b"alpha-NEW-and-longer-middle-tail";
+        let edits = derive_edits(base, child);
+        assert_eq!(edits.len(), 1);
+        assert_eq!(apply_edits(base, &edits).unwrap(), child);
+    }
+
+    #[test]
+    fn identical_inputs_need_no_edits() {
         let bytes = b"same bytes";
-        let edit = derive_edit(bytes, bytes);
-        assert_eq!(edit.delete_len, 0);
-        assert!(edit.insert.is_empty());
-        assert_eq!(edit.apply(bytes).unwrap(), bytes);
+        let edits = derive_edits(bytes, bytes);
+        assert!(edits.is_empty());
+        assert_eq!(apply_edits(bytes, &edits).unwrap(), bytes);
+    }
+
+    #[test]
+    fn pack_diff_keeps_distant_file_changes_separate() {
+        let base = pack(&[
+            (b"a.txt", b"alpha OLD tail"),
+            (b"middle.bin", &[b'x'; 128]),
+            (b"z.txt", b"omega OLD tail"),
+        ]);
+        let child = pack(&[
+            (b"a.txt", b"alpha NEW tail"),
+            (b"middle.bin", &[b'x'; 128]),
+            (b"z.txt", b"omega NEW tail"),
+        ]);
+        let edits = derive_edits(&base, &child);
+        assert_eq!(edits.len(), 2, "two distant modified files should yield two edits");
+        assert_eq!(apply_edits(&base, &edits).unwrap(), child);
+        let inserted: usize = edits.iter().map(|edit| edit.insert.len()).sum();
+        assert!(inserted < 64, "unchanged middle file must not be rewritten");
+    }
+
+    #[test]
+    fn pack_diff_handles_added_and_deleted_files() {
+        let base = pack(&[(b"a.txt", b"a"), (b"gone.txt", b"old"), (b"z.txt", b"z")]);
+        let child = pack(&[(b"a.txt", b"a"), (b"new.txt", b"new"), (b"z.txt", b"z")]);
+        let edits = derive_edits(&base, &child);
+        assert_eq!(apply_edits(&base, &edits).unwrap(), child);
+        assert!(edits.len() >= 1);
     }
 }
