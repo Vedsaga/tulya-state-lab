@@ -3,3 +3,5 @@ target/
 *.profraw
 results/*.csv
 results/*.json
+.trace-cache/
+traces/
