@@ -1,5 +1,6 @@
 use crate::model::{Backend, BackendStats, Edit, StateError};
 use std::cmp::max;
+use std::collections::HashMap;
 use std::mem::size_of;
 use std::sync::{Arc, Weak};
 
@@ -33,16 +34,18 @@ struct TrackedBuffer {
     bytes: usize,
 }
 
-/// Persistent copy-on-write piece rope.
+/// Persistent copy-on-write piece rope with exact-content buffer interning.
 ///
-/// This intentionally uses the same broad path-copying balanced-tree idea as
-/// the AVL byte rope, but leaf pieces point into immutable shared buffers.
-/// Splitting a piece therefore allocates metadata only; it does not copy the
-/// bytes on either side of an edit. Each inserted payload is allocated once.
+/// The tree remains an ordinary path-copying balanced rope whose leaves point
+/// into immutable shared buffers. Splitting a piece allocates metadata only.
+/// New backing buffers are indexed by content hash and reused only after an
+/// exact byte-for-byte equality check, so unrelated branches can share equal
+/// inserted payloads without introducing grammar/recompression machinery.
 pub struct PieceCow {
     leaf_bytes: usize,
     nodes: Vec<TrackedNode>,
     buffers: Vec<TrackedBuffer>,
+    buffer_index: HashMap<u64, Vec<Weak<[u8]>>>,
     lifetime_payload_bytes: usize,
     lifetime_metadata_bytes: usize,
 }
@@ -54,21 +57,51 @@ impl PieceCow {
             leaf_bytes,
             nodes: Vec::new(),
             buffers: Vec::new(),
+            buffer_index: HashMap::new(),
             lifetime_payload_bytes: 0,
             lifetime_metadata_bytes: 0,
         }
+    }
+
+    fn hash_bytes(bytes: &[u8]) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for &byte in bytes {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
     }
 
     fn alloc_buffer(&mut self, bytes: &[u8]) -> Option<Arc<[u8]>> {
         if bytes.is_empty() {
             return None;
         }
+
+        let hash = Self::hash_bytes(bytes);
+        if let Some(candidates) = self.buffer_index.get_mut(&hash) {
+            let mut reused = None;
+            candidates.retain(|weak| {
+                let Some(buffer) = weak.upgrade() else {
+                    return false;
+                };
+                if reused.is_none() && buffer.as_ref() == bytes {
+                    reused = Some(buffer);
+                }
+                true
+            });
+            if let Some(buffer) = reused {
+                return Some(buffer);
+            }
+        }
+
         let buffer: Arc<[u8]> = Arc::from(bytes.to_vec().into_boxed_slice());
         self.lifetime_payload_bytes = self
             .lifetime_payload_bytes
             .saturating_add(buffer.len());
+        let weak = Arc::downgrade(&buffer);
+        self.buffer_index.entry(hash).or_default().push(weak.clone());
         self.buffers.push(TrackedBuffer {
-            weak: Arc::downgrade(&buffer),
+            weak,
             bytes: buffer.len(),
         });
         Some(buffer)
@@ -346,7 +379,7 @@ impl Backend for PieceCow {
     type Snapshot = Snapshot;
 
     fn name(&self) -> &'static str {
-        "persistent-piece-cow"
+        "persistent-piece-cow-interned"
     }
 
     fn create(&mut self, bytes: &[u8]) -> Self::Snapshot {
@@ -491,6 +524,36 @@ mod tests {
         let after = pieces.stats().retained_payload_bytes;
         assert_eq!(before, after, "splitting/deleting should not copy old payload");
         assert_eq!(pieces.read_all(&child).unwrap().len(), 4095);
+    }
+
+    #[test]
+    fn exact_equal_insertions_share_one_backing_buffer() {
+        let mut pieces = PieceCow::new(4096);
+        let base_bytes = b"abcdefghij".to_vec();
+        let base = pieces.create(&base_bytes);
+        let payload = vec![b'z'; 8192];
+
+        let first_edit = Edit {
+            start: 2,
+            delete_len: 0,
+            insert: payload.clone(),
+        };
+        let first_expected = first_edit.apply(&base_bytes).unwrap();
+        let first = pieces.edit(&base, &first_edit).unwrap();
+        let after_first = pieces.stats().retained_payload_bytes;
+
+        let second_edit = Edit {
+            start: 7,
+            delete_len: 0,
+            insert: payload,
+        };
+        let second_expected = second_edit.apply(&base_bytes).unwrap();
+        let second = pieces.edit(&base, &second_edit).unwrap();
+        let after_second = pieces.stats().retained_payload_bytes;
+
+        assert_eq!(after_first, after_second, "equal inserted payload should be interned");
+        assert_eq!(pieces.read_all(&first).unwrap(), first_expected);
+        assert_eq!(pieces.read_all(&second).unwrap(), second_expected);
     }
 
     #[test]
