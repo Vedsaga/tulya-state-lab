@@ -1,7 +1,11 @@
 use std::env;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use tulya_state_lab::avl::AvlRope;
 use tulya_state_lab::cdc::CdcStore;
+use tulya_state_lab::corpus::{
+    run_corpus_backend, verify_corpus_pair, Corpus, CorpusReport,
+};
 use tulya_state_lab::piece_cow::PieceCow;
 use tulya_state_lab::workload::{
     run_backend, verify_pair, Config, Report, Workload, WorkloadKind,
@@ -12,6 +16,7 @@ struct Cli {
     config: Config,
     leaf_bytes: usize,
     avg_chunk_bytes: usize,
+    corpus_manifest: Option<PathBuf>,
 }
 
 impl Default for Cli {
@@ -20,6 +25,7 @@ impl Default for Cli {
             config: Config::default(),
             leaf_bytes: 4096,
             avg_chunk_bytes: 4096,
+            corpus_manifest: None,
         }
     }
 }
@@ -27,6 +33,7 @@ impl Default for Cli {
 fn usage() -> &'static str {
     "state-lab [options]\n\n\
      Options:\n\
+       --corpus-manifest P   real snapshot-pair manifest; bypass synthetic workload\n\
        --workload NAME       small-edit | append-heavy | cross-template | large-rewrite\n\
        --branches N          number of child versions (default 1000)\n\
        --base-mib N          base state size in MiB (default 2)\n\
@@ -74,6 +81,7 @@ fn parse_cli() -> Result<Cli, String> {
             .get(i + 1)
             .ok_or_else(|| format!("missing value for {flag}"))?;
         match flag.as_str() {
+            "--corpus-manifest" => cli.corpus_manifest = Some(PathBuf::from(value)),
             "--workload" => {
                 cli.config.kind = WorkloadKind::parse(value).ok_or_else(|| {
                     format!(
@@ -123,6 +131,13 @@ fn retained_growth(report: &Report) -> usize {
         .saturating_sub(report.initial_stats.retained_bytes())
 }
 
+fn corpus_growth(report: &CorpusReport) -> usize {
+    report
+        .final_stats
+        .retained_bytes()
+        .saturating_sub(report.base_stats.retained_bytes())
+}
+
 fn print_report(report: &Report, branches: usize) {
     let final_retained = report.final_stats.retained_bytes();
     let retained_growth = retained_growth(report);
@@ -169,6 +184,61 @@ fn print_report(report: &Report, branches: usize) {
     println!("  checksum: {:016x}", report.checksum);
 }
 
+fn print_corpus_report(report: &CorpusReport) {
+    let growth = corpus_growth(report);
+    let lifetime_growth = report
+        .final_stats
+        .lifetime_allocated_bytes()
+        .saturating_sub(report.base_stats.lifetime_allocated_bytes());
+    let denom = report.cases.max(1) as f64;
+    println!("backend: {}", report.backend);
+    println!(
+        "  base_build_ms_total: {:.3}",
+        report.base_build_ns as f64 / 1_000_000.0
+    );
+    println!(
+        "  edit_us p50/p95/p99: {:.3} / {:.3} / {:.3}",
+        ns_to_us(report.edit.p50_ns),
+        ns_to_us(report.edit.p95_ns),
+        ns_to_us(report.edit.p99_ns)
+    );
+    println!(
+        "  read_us p50/p95/p99: {:.3} / {:.3} / {:.3}",
+        ns_to_us(report.read.p50_ns),
+        ns_to_us(report.read.p95_ns),
+        ns_to_us(report.read.p99_ns)
+    );
+    println!(
+        "  base_retained_total_mib_est: {:.3}",
+        mib(report.base_stats.retained_bytes())
+    );
+    println!(
+        "  final_retained_payload_mib: {:.3}",
+        mib(report.final_stats.retained_payload_bytes)
+    );
+    println!(
+        "  final_retained_metadata_mib_est: {:.3}",
+        mib(report.final_stats.retained_metadata_bytes)
+    );
+    println!(
+        "  final_retained_total_mib_est: {:.3}",
+        mib(report.final_stats.retained_bytes())
+    );
+    println!(
+        "  child_growth_bytes_per_case_est: {:.1}",
+        growth as f64 / denom
+    );
+    println!(
+        "  lifetime_repr_alloc_bytes_per_case_est: {:.1}",
+        lifetime_growth as f64 / denom
+    );
+    println!(
+        "  live_objects / allocated_objects: {} / {}",
+        report.final_stats.live_objects, report.final_stats.total_objects_allocated
+    );
+    println!("  checksum: {:016x}", report.checksum);
+}
+
 fn compare_reports(left: &Report, right: &Report) {
     let left_growth = retained_growth(left);
     let right_growth = retained_growth(right);
@@ -190,8 +260,75 @@ fn compare_reports(left: &Report, right: &Report) {
     );
 }
 
-fn run() -> Result<(), String> {
-    let cli = parse_cli()?;
+fn compare_corpus_reports(left: &CorpusReport, right: &CorpusReport) {
+    let left_growth = corpus_growth(left);
+    let right_growth = corpus_growth(right);
+    println!("  {} vs {}", left.backend, right.backend);
+    println!("    child growth: {} vs {} bytes", left_growth, right_growth);
+    if right_growth > 0 {
+        println!(
+            "    child-growth ratio: {:.3}x",
+            left_growth as f64 / right_growth as f64
+        );
+    }
+    println!(
+        "    edit p95 ratio: {:.3}x",
+        left.edit.p95_ns as f64 / right.edit.p95_ns.max(1) as f64
+    );
+    println!(
+        "    read p95 ratio: {:.3}x",
+        left.read.p95_ns as f64 / right.read.p95_ns.max(1) as f64
+    );
+}
+
+fn run_corpus(cli: &Cli, manifest: &PathBuf) -> Result<(), String> {
+    println!("tulya-state-lab real corpus");
+    println!(
+        "config: manifest={}, read_bytes={}, leaf_bytes={}, avg_chunk_bytes={}, verify_samples={}",
+        manifest.display(),
+        cli.config.read_bytes,
+        cli.leaf_bytes,
+        cli.avg_chunk_bytes,
+        cli.config.verify_samples
+    );
+    println!("loading snapshot pairs...");
+    let corpus = Corpus::load_manifest(manifest, cli.config.read_bytes)?;
+    println!(
+        "cases: {}, logical base+child bytes: {} ({:.3} GiB)",
+        corpus.cases.len(),
+        corpus.logical_bytes,
+        corpus.logical_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+    );
+
+    println!("\nrunning persistent AVL byte rope...");
+    let avl = run_corpus_backend(AvlRope::new(cli.leaf_bytes), &corpus)
+        .map_err(|e| e.to_string())?;
+    print_corpus_report(&avl.report);
+
+    println!("\nrunning persistent COW piece rope...");
+    let cow = run_corpus_backend(PieceCow::new(cli.leaf_bytes), &corpus)
+        .map_err(|e| e.to_string())?;
+    print_corpus_report(&cow.report);
+
+    println!("\nrunning incremental windowed CDC...");
+    let cdc = run_corpus_backend(CdcStore::new(cli.avg_chunk_bytes), &corpus)
+        .map_err(|e| e.to_string())?;
+    print_corpus_report(&cdc.report);
+
+    println!("\nverifying sampled real children across all backends...");
+    verify_corpus_pair(&avl, &cow, &corpus, cli.config.verify_samples)?;
+    verify_corpus_pair(&cow, &cdc, &corpus, cli.config.verify_samples)?;
+    println!("semantic cross-check: PASS (3 backends)");
+
+    println!("\ncomparison (left/right; lower is better; child growth excludes retained bases):");
+    compare_corpus_reports(&avl.report, &cow.report);
+    compare_corpus_reports(&cow.report, &cdc.report);
+    compare_corpus_reports(&avl.report, &cdc.report);
+    println!("\nThis corpus path uses one exact contiguous replacement per base/child pair; interpret multi-file patches as a conservative snapshot-diff gate.");
+    Ok(())
+}
+
+fn run_synthetic(cli: &Cli) -> Result<(), String> {
     println!("tulya-state-lab");
     println!(
         "config: workload={}, branches={}, base_bytes={}, edit_bytes={}, read_bytes={}, leaf_bytes={}, avg_chunk_bytes={}, seed=0x{:016x}",
@@ -235,6 +372,15 @@ fn run() -> Result<(), String> {
     compare_reports(&avl.report, &cdc.report);
     println!("\nNo representation is promoted by this program; interpret the numbers against the README decision rule.");
     Ok(())
+}
+
+fn run() -> Result<(), String> {
+    let cli = parse_cli()?;
+    if let Some(manifest) = &cli.corpus_manifest {
+        run_corpus(&cli, manifest)
+    } else {
+        run_synthetic(&cli)
+    }
 }
 
 fn main() -> ExitCode {
