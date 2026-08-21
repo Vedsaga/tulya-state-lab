@@ -3,7 +3,9 @@ use std::process::ExitCode;
 use tulya_state_lab::avl::AvlRope;
 use tulya_state_lab::cdc::CdcStore;
 use tulya_state_lab::piece_cow::PieceCow;
-use tulya_state_lab::workload::{run_backend, verify_pair, Config, Report, Workload};
+use tulya_state_lab::workload::{
+    run_backend, verify_pair, Config, Report, Workload, WorkloadKind,
+};
 
 #[derive(Clone, Debug)]
 struct Cli {
@@ -25,10 +27,11 @@ impl Default for Cli {
 fn usage() -> &'static str {
     "state-lab [options]\n\n\
      Options:\n\
+       --workload NAME       small-edit | append-heavy | cross-template | large-rewrite\n\
        --branches N          number of child versions (default 1000)\n\
        --base-mib N          base state size in MiB (default 2)\n\
        --base-kib N          base state size in KiB (overrides --base-mib)\n\
-       --edit-bytes N        maximum inserted/deleted bytes per edit (default 96)\n\
+       --edit-bytes N        edit/payload scale in bytes (default 96)\n\
        --read-bytes N        range-read bytes per child (default 4096)\n\
        --leaf-bytes N        AVL/COW rope leaf size (default 4096)\n\
        --avg-chunk-bytes N   CDC target average chunk size (default 4096)\n\
@@ -71,6 +74,13 @@ fn parse_cli() -> Result<Cli, String> {
             .get(i + 1)
             .ok_or_else(|| format!("missing value for {flag}"))?;
         match flag.as_str() {
+            "--workload" => {
+                cli.config.kind = WorkloadKind::parse(value).ok_or_else(|| {
+                    format!(
+                        "unknown workload: {value}; expected small-edit, append-heavy, cross-template, or large-rewrite"
+                    )
+                })?
+            }
             "--branches" => cli.config.branches = parse_usize(value)?,
             "--base-mib" => {
                 cli.config.base_bytes = checked_scale(parse_usize(value)?, 1024 * 1024, flag)?
@@ -182,9 +192,10 @@ fn compare_reports(left: &Report, right: &Report) {
 
 fn run() -> Result<(), String> {
     let cli = parse_cli()?;
-    println!("tulya-state-lab phase 1");
+    println!("tulya-state-lab");
     println!(
-        "config: branches={}, base_bytes={}, max_edit_bytes={}, read_bytes={}, leaf_bytes={}, avg_chunk_bytes={}, seed=0x{:016x}",
+        "config: workload={}, branches={}, base_bytes={}, edit_bytes={}, read_bytes={}, leaf_bytes={}, avg_chunk_bytes={}, seed=0x{:016x}",
+        cli.config.kind.as_str(),
         cli.config.branches,
         cli.config.base_bytes,
         cli.config.max_edit_bytes,
@@ -222,7 +233,7 @@ fn run() -> Result<(), String> {
     compare_reports(&avl.report, &cow.report);
     compare_reports(&cow.report, &cdc.report);
     compare_reports(&avl.report, &cdc.report);
-    println!("\nNo representation is promoted by this program; interpret the numbers against the README kill criteria.");
+    println!("\nNo representation is promoted by this program; interpret the numbers against the README decision rule.");
     Ok(())
 }
 
