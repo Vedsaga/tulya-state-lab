@@ -8,7 +8,7 @@ use std::time::Instant;
 pub struct CorpusCase {
     pub id: String,
     pub base: Vec<u8>,
-    pub child: Vec<u8>,
+    pub child_len: usize,
     pub edit: Edit,
     pub read_start: usize,
     pub read_len: usize,
@@ -33,11 +33,11 @@ pub struct CorpusReport {
     pub logical_bytes: u128,
 }
 
-pub struct CorpusRun<B: Backend> {
-    pub backend: B,
-    pub bases: Vec<B::Snapshot>,
-    pub children: Vec<B::Snapshot>,
+#[derive(Clone, Debug)]
+pub struct CorpusOutcome {
     pub report: CorpusReport,
+    pub sample_indices: Vec<usize>,
+    pub sample_children: Vec<Vec<u8>>,
 }
 
 fn derive_edit(base: &[u8], child: &[u8]) -> Edit {
@@ -85,6 +85,19 @@ fn resolve_path(root: &Path, value: &str) -> PathBuf {
     }
 }
 
+fn sample_indices(total: usize, verify_samples: usize) -> Vec<usize> {
+    let count = verify_samples.max(2).min(total);
+    (0..count)
+        .map(|sample| {
+            if sample + 1 == count {
+                total - 1
+            } else {
+                sample.saturating_mul(total - 1) / (count - 1)
+            }
+        })
+        .collect()
+}
+
 impl Corpus {
     /// Load a tab-separated manifest with at least three columns:
     ///
@@ -125,6 +138,7 @@ impl Corpus {
                     child_path.display()
                 )
             })?;
+            let child_len = child.len();
             let edit = derive_edit(&base, &child);
             let rebuilt = edit
                 .apply(&base)
@@ -133,19 +147,19 @@ impl Corpus {
                 return Err(format!("derived edit for {id} does not reconstruct child"));
             }
 
-            let read_len = read_bytes.min(child.len());
+            let read_len = read_bytes.min(child_len);
             let read_start = if read_len == 0 {
                 0
             } else {
-                (id_hash(&id) as usize) % (child.len() - read_len + 1)
+                (id_hash(&id) as usize) % (child_len - read_len + 1)
             };
             logical_bytes = logical_bytes
                 .saturating_add(base.len() as u128)
-                .saturating_add(child.len() as u128);
+                .saturating_add(child_len as u128);
             cases.push(CorpusCase {
                 id,
                 base,
-                child,
+                child_len,
                 edit,
                 read_start,
                 read_len,
@@ -183,7 +197,8 @@ fn summarize(values: &[u64]) -> LatencySummary {
 pub fn run_corpus_backend<B: Backend>(
     mut backend: B,
     corpus: &Corpus,
-) -> Result<CorpusRun<B>, StateError> {
+    verify_samples: usize,
+) -> Result<CorpusOutcome, StateError> {
     let base_build_start = Instant::now();
     let mut bases = Vec::with_capacity(corpus.cases.len());
     for case in &corpus.cases {
@@ -204,7 +219,7 @@ pub fn run_corpus_backend<B: Backend>(
         let edit_start = Instant::now();
         let child = backend.edit(base, &case.edit)?;
         edit_latencies.push(edit_start.elapsed().as_nanos().min(u64::MAX as u128) as u64);
-        if backend.len(&child) != case.child.len() {
+        if backend.len(&child) != case.child_len {
             return Err(StateError::Corrupt("corpus edit produced wrong child length"));
         }
 
@@ -216,6 +231,15 @@ pub fn run_corpus_backend<B: Backend>(
     }
 
     let final_stats = backend.stats();
+    let selected = sample_indices(corpus.cases.len(), verify_samples);
+    let mut sample_children = Vec::with_capacity(selected.len());
+    for &index in &selected {
+        backend
+            .validate(&children[index])
+            .map_err(|_| StateError::Corrupt("corpus backend validation failed"))?;
+        sample_children.push(backend.read_all(&children[index])?);
+    }
+
     let report = CorpusReport {
         backend: backend.name(),
         base_build_ns,
@@ -227,42 +251,34 @@ pub fn run_corpus_backend<B: Backend>(
         cases: corpus.cases.len(),
         logical_bytes: corpus.logical_bytes,
     };
-    Ok(CorpusRun {
-        backend,
-        bases,
-        children,
+    Ok(CorpusOutcome {
         report,
+        sample_indices: selected,
+        sample_children,
     })
 }
 
-pub fn verify_corpus_pair<A: Backend, B: Backend>(
-    left: &CorpusRun<A>,
-    right: &CorpusRun<B>,
+pub fn verify_corpus_outcomes(
+    left: &CorpusOutcome,
+    right: &CorpusOutcome,
     corpus: &Corpus,
-    verify_samples: usize,
 ) -> Result<(), String> {
-    if left.children.len() != corpus.cases.len() || right.children.len() != corpus.cases.len() {
-        return Err("corpus backend child counts differ".into());
+    if left.sample_indices != right.sample_indices
+        || left.sample_children.len() != left.sample_indices.len()
+        || right.sample_children.len() != right.sample_indices.len()
+    {
+        return Err("corpus verification sample sets differ".into());
     }
-    let count = verify_samples.max(2).min(corpus.cases.len());
-    for sample in 0..count {
-        let index = if sample + 1 == count {
-            corpus.cases.len() - 1
-        } else {
-            sample.saturating_mul(corpus.cases.len() - 1) / (count - 1)
-        };
+
+    for (sample_pos, &index) in left.sample_indices.iter().enumerate() {
         let case = &corpus.cases[index];
-        left.backend.validate(&left.children[index])?;
-        right.backend.validate(&right.children[index])?;
-        let left_bytes = left
-            .backend
-            .read_all(&left.children[index])
-            .map_err(|e| e.to_string())?;
-        let right_bytes = right
-            .backend
-            .read_all(&right.children[index])
-            .map_err(|e| e.to_string())?;
-        if left_bytes != case.child || right_bytes != case.child || left_bytes != right_bytes {
+        let expected = case
+            .edit
+            .apply(&case.base)
+            .map_err(|e| format!("failed to reconstruct expected child {}: {e}", case.id))?;
+        let left_bytes = &left.sample_children[sample_pos];
+        let right_bytes = &right.sample_children[sample_pos];
+        if left_bytes != &expected || right_bytes != &expected || left_bytes != right_bytes {
             return Err(format!("corpus semantic mismatch at case {}", case.id));
         }
     }
