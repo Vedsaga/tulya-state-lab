@@ -13,5 +13,11 @@ jobs:
         run: rustup default stable
       - name: Test
         run: cargo test --all-targets
-      - name: Smoke benchmark
-        run: cargo run --release -- --branches 128 --base-kib 256 --verify-samples 12
+      - name: Smoke small-edit
+        run: cargo run --release -- --workload small-edit --branches 32 --base-kib 64 --edit-bytes 64 --verify-samples 8
+      - name: Smoke append-heavy
+        run: cargo run --release -- --workload append-heavy --branches 32 --base-kib 64 --edit-bytes 256 --verify-samples 8
+      - name: Smoke cross-template
+        run: cargo run --release -- --workload cross-template --branches 24 --base-kib 64 --edit-bytes 4096 --verify-samples 8
+      - name: Smoke large-rewrite
+        run: cargo run --release -- --workload large-rewrite --branches 24 --base-kib 128 --edit-bytes 4096 --verify-samples 8
