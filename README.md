@@ -84,11 +84,21 @@ case_id<TAB>base_snapshot_path<TAB>child_snapshot_path
 
 Extra columns are ignored, so source metadata can travel with the corpus.
 
-All base snapshots are loaded first. The harness records retained base storage, then applies one exact child transition per case and reports **child growth separately from base storage**. Each transition is derived as the shortest single contiguous replacement obtained from the longest common prefix and suffix of the two byte snapshots.
+All base snapshots are loaded first. The harness records retained base storage, then applies the exact child transition for each case and reports **child growth separately from base storage**.
 
-That representation is byte-exact but conservative for patches touching multiple distant files: the replacement spans from the first changed byte to the last changed byte. Treat this as a snapshot-diff gate, not as a claim that it captures an optimal multi-edit script.
+For repository snapshots produced by `scripts/prepare_swebench_verified.py`, the transition is now **file-aware** rather than one repository-wide span:
 
-The real-corpus path runs backends sequentially and retains only sampled decoded children for cross-backend verification, so validation memory is bounded relative to the corpus size.
+- unchanged tracked files generate no edit;
+- a common path with changed encoded bytes gets its own exact longest-prefix/suffix replacement;
+- added/deleted/renamed path runs become separate structural replacements;
+- all edits are expressed in original-base coordinates and applied from high offsets to low offsets;
+- the entire script is applied to the raw base bytes and must reproduce the child byte-for-byte before benchmarking.
+
+Unknown snapshot formats still fall back to one exact contiguous longest-prefix/suffix replacement.
+
+The real-corpus path runs backends sequentially and retains only sampled decoded children for cross-backend verification, so validation memory is bounded relative to the corpus size. Multiple file-aware edits are timed together as one case. Only the final child snapshot is intentionally retained.
+
+One implementation caveat remains: the current CDC prototype keeps interned chunks in a strong global pool and does not reclaim chunks created only by transient intermediate edit stages. COW/AVL can release unreachable intermediate nodes through `Arc`. Therefore a **narrow CDC storage loss on a multi-hunk corpus must be treated conservatively** until CDC reclamation is added; a large CDC win despite this handicap is stronger evidence.
 
 ## First external gate: SWE-bench Verified
 
@@ -96,9 +106,9 @@ The real-corpus path runs backends sequentially and retains only sampled decoded
 
 ### Preliminary 20-case result — real but not diverse
 
-The first 20 sequential dataset rows all came from `astropy/astropy`, so this is a real-repository result but **not** a representative SWE-bench-wide sample.
+The first 20 sequential dataset rows all came from `astropy/astropy`, so this is a real-repository result but **not** a representative SWE-bench-wide sample. It was also measured with the old single-contiguous-span corpus edit model.
 
-All three backends reconstructed the sampled children byte-for-byte. On child-version growth:
+All three backends reconstructed the sampled children byte-for-byte. Under that old gate:
 
 | backend | child growth / case | edit p95 | read p95 |
 | --- | ---: | ---: | ---: |
@@ -106,22 +116,27 @@ All three backends reconstructed the sampled children byte-for-byte. On child-ve
 | persistent COW + exact interning | **89,759.1 B** | 73.509 us | 2.685 us |
 | incremental windowed CDC | 121,881.6 B | 541.396 us | **1.603 us** |
 
-For this Astropy-only sample, COW used about **26% less new child storage** than CDC and had about **7.4x lower p95 edit latency**. That supports COW for incremental branch/checkpoint growth, but the sample is too narrow to generalize.
+There was also a separate cold/global-storage signal: retained base storage was about **672 MiB for COW versus 117 MiB for CDC**. Those bases were nearby revisions of one repository, so CDC cross-snapshot chunk deduplication was strongly favored. Keep this metric separate from child growth.
 
-There is a separate cold/global-storage signal: retained base storage was about **672 MiB for COW versus 117 MiB for CDC**. These bases are nearby revisions of one repository, so CDC's cross-snapshot chunk deduplication is strongly favored. Keep this metric separate from child growth; the next diverse sample is intended to test whether that advantage survives across repositories.
+### Diverse 24-case result under old single-span gate — quarantined
 
-### Repository-diverse sample
+Repository-round-robin sampling produced a 24-case corpus spanning multiple repositories. Semantics again matched across all three backends. Under the old rule that collapsed the entire repository transition into one replacement from the first changed byte to the last, the result flipped dramatically:
 
-The preparer now supports deterministic repository round-robin selection. It preserves dataset order within each repository, but interleaves repositories before taking the requested limit.
+| backend | child growth / case | edit p95 | read p95 | retained bases |
+| --- | ---: | ---: | ---: | ---: |
+| persistent AVL byte rope | 2,263,221.8 B | **169.314 us** | 2.736 us | 449.205 MiB |
+| persistent COW + exact interning | 2,268,658.7 B | 318.510 us | 2.395 us | 450.926 MiB |
+| incremental windowed CDC | **79,678.2 B** | 1,524.929 us | **1.853 us** | **252.086 MiB** |
 
-Use a new output directory so the preliminary Astropy-only corpus stays reproducible:
+The roughly **28.5x CDC child-growth advantage is not accepted as an architectural verdict** because the edit model is a direct confound. Two small edits in distant files can force the tree representations to replace every packed byte between those files, while CDC can resynchronize inside that artificial span and rediscover unchanged chunks. The near-identical ~2.26 MiB child growth of AVL and COW is itself evidence that this gate is dominated by the serialized replacement span rather than ancestry-local payload-copy behavior.
+
+The cold-base result is less affected by edit-script quality: on this diverse sample CDC retained about 252 MiB of bases versus about 451 MiB for COW. That is a real signal for global deduplication across independent roots and should continue to be tracked separately.
+
+### Required rerun — file-aware exact scripts
+
+The existing prepared corpus can be reused; no new repository downloads are needed.
 
 ```bash
-python3 scripts/prepare_swebench_verified.py \
-  --selection repo-round-robin \
-  --limit 24 \
-  --out traces/swebench-verified-diverse
-
 cargo test --all-targets
 
 cargo run --release -- \
@@ -129,9 +144,13 @@ cargo run --release -- \
   --verify-samples 16
 ```
 
-The script prints the number and names of selected repositories before cloning/preparing cases. Repository clones are cached under `.trace-cache/swebench-verified`, so any already-fetched repositories can be reused.
+The output now reports `derived exact edit hunks` before the backend runs. Do not scale to all 500 instances or implement grammar/recompression until this corrected gate is measured.
 
-Do not scale to all 500 instances yet. The next decision should be based on whether the ranking and the cold-base-storage signal survive repository diversity.
+Interpretation rule for the corrected rerun:
+
+- if CDC still wins child growth by a large multiple, conventional COW has a real weakness on repository-style multi-edit checkpoints;
+- if the gap collapses and COW wins or comes close, the old 28x result was largely an edit-script artifact;
+- if CDC loses narrowly, add transient-chunk reclamation before rejecting it, because the current strong chunk pool over-retains multi-hunk repair allocations.
 
 ## What is measured
 
