@@ -13,7 +13,7 @@ The lab exists to answer one question:
 The first controlled workload compared three representations under the same deterministic arbitrary-parent branch/edit/read plan:
 
 - **persistent AVL byte rope** — immutable `Arc` nodes, path-copying split/join, AVL rebalancing, 4 KiB-style byte leaves, direct range traversal. Splitting a leaf copies the affected leaf fragments.
-- **persistent COW piece rope** — persistent balanced-tree indexing whose leaves are slices of immutable shared buffers. Splitting a piece allocates metadata only; unchanged bytes are never copied and each inserted payload is allocated once.
+- **persistent COW piece rope** — persistent balanced-tree indexing whose leaves are slices of immutable shared buffers. Splitting a piece allocates metadata only; unchanged bytes are never copied.
 - **incremental windowed CDC** — fixed-window rolling content-defined chunking with exact-byte deduplication and flat per-version manifests. Edits re-chunk only a repair region and reuse the untouched old suffix after exact boundary resynchronization.
 
 At 1,000 branches over a 2 MiB base state (seed `0x5eed1234d15ca11e`, max edit 96 bytes, 4 KiB reads), all three backends produced the same checksum and sampled historical versions matched byte-for-byte.
@@ -36,9 +36,7 @@ Results produced before commit `2f4147cdc95b6e3347b10983a9f846990b7d2684` used a
 
 ## Phase 2 — workload falsification
 
-Do not add another representation yet. First test whether persistent COW has an actual weakness on workload shapes where global content sharing or compression could plausibly matter.
-
-The CLI supports four deterministic workload families:
+The four deterministic workload families are:
 
 | workload | purpose |
 | --- | --- |
@@ -47,35 +45,32 @@ The CLI supports four deterministic workload families:
 | `cross-template` | unrelated branches independently inject one of four identical large structured payloads; challenges ancestry-only COW with reusable content |
 | `large-rewrite` | arbitrary historical parents replace large contiguous regions with fresh generated content |
 
-`--edit-bytes` is deliberately explicit. For `small-edit` it is the maximum small edit size; for `append-heavy` it is the maximum appended payload; for `cross-template` it is the exact repeated template payload size; for `large-rewrite` it is the rewrite payload/target-region scale.
+The Phase-2 runs showed COW winning the small-edit and large-rewrite workloads and remaining competitive on append-heavy history. `cross-template`, deliberately constructed to favor global deduplication, was the only case where CDC used less retained storage: about 52.9 KiB/branch versus 67.8 KiB/branch for the original COW implementation, while CDC paid roughly two orders of magnitude more p95 edit latency.
 
-The synthetic Phase-2 matrix is:
+That result does **not** justify grammar/recompression. The simpler next adversary is conventional COW plus exact-content interning of immutable backing buffers.
+
+## COW + exact buffer interning
+
+`persistent-piece-cow-interned` keeps the same persistent piece tree. The only change is backing-buffer allocation:
+
+1. hash the candidate immutable buffer;
+2. inspect only candidates with the same hash;
+3. require exact byte-for-byte equality before reuse;
+4. otherwise allocate a new `Arc<[u8]>`.
+
+The hash is therefore only a lookup accelerator; collisions cannot cause false sharing. The interning index stores weak references and does not keep otherwise-dead buffers alive. Hash-table bucket/control overhead remains excluded from the representation-size estimate, consistently with the existing CDC accounting.
+
+This follow-up has exactly two useful synthetic reruns:
 
 ```bash
 cargo test --all-targets
 
-# Frozen Phase-1 control.
-cargo run --release -- \
-  --workload small-edit \
-  --branches 1000 \
-  --base-mib 2 \
-  --edit-bytes 96
-
-# Agent-history shape: mostly append to latest, with historical forks.
-cargo run --release -- \
-  --workload append-heavy \
-  --branches 1000 \
-  --base-mib 2 \
-  --edit-bytes 512
-
-# Global-reuse challenge: large identical payloads recur across unrelated branches.
 cargo run --release -- \
   --workload cross-template \
   --branches 500 \
   --base-mib 2 \
   --edit-bytes 65536
 
-# Large independent rewrites from arbitrary historical parents.
 cargo run --release -- \
   --workload large-rewrite \
   --branches 500 \
@@ -83,13 +78,9 @@ cargo run --release -- \
   --edit-bytes 65536
 ```
 
-Do not scale branch counts merely to amplify an already-clear result. The important question is whether the **ranking changes by workload**.
+If exact buffer interning erases the cross-template storage advantage while preserving COW's latency advantage, do **not** add another synthetic representation. Move directly to real repository/agent state traces.
 
-In particular, `cross-template` is the critical synthetic test. Persistent COW allocates each independently inserted 64 KiB payload even if an unrelated branch inserted identical bytes earlier. CDC can potentially deduplicate stable internal chunks across those lineages. If even this deliberately favorable global-reuse workload does not create a material storage advantage over COW, there is little reason to implement grammar/recompression next.
-
-`large-rewrite` is intentionally unfavorable to all ancestry-local schemes when rewritten bytes are genuinely new. It tests whether the COW baseline remains operationally simple and competitive once edit payloads stop being tiny.
-
-Synthetic results are still not product evidence. If a representation survives this matrix, the next step is **real repository/agent state traces**, not more synthetic parameter sweeps.
+If CDC still retains a large, credible storage advantage after this change, inspect why before considering any grammar/recompression design.
 
 ## What is measured
 
@@ -101,7 +92,7 @@ Storage numbers are **estimates**, not RSS or filesystem bytes. They count paylo
 
 A representation is not interesting merely because it is elegant, persistent, compressed, or formally provable.
 
-The current baseline to beat is **persistent COW pieces**, not the AVL byte rope. If a more elaborate candidate comes within roughly 20–25% of COW on intended workloads while adding substantial complexity, prefer COW. A grammar/recompression candidate should only survive if it produces a large combined gain that remains after metadata, random/range reads, edit latency, and realistic state shapes are counted.
+The current baseline to beat is **persistent COW pieces with exact immutable-buffer interning**, not the AVL byte rope. If a more elaborate candidate comes within roughly 20–25% of this baseline on intended workloads while adding substantial complexity, prefer COW. A grammar/recompression candidate should only survive if it produces a large combined gain that remains after metadata, random/range reads, edit latency, and realistic state shapes are counted.
 
 The incremental CDC backend remains useful for measuring content-defined dedup behavior, but its flat version manifests give it a metadata disadvantage relative to tree-based representations. Do not attribute that metadata gap to intrinsic CDC payload behavior.
 
