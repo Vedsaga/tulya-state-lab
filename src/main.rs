@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use tulya_state_lab::avl::AvlRope;
 use tulya_state_lab::cdc::CdcStore;
 use tulya_state_lab::corpus::{
-    run_corpus_backend, verify_corpus_pair, Corpus, CorpusReport,
+    run_corpus_backend, verify_corpus_outcomes, Corpus, CorpusReport,
 };
 use tulya_state_lab::piece_cow::PieceCow;
 use tulya_state_lab::workload::{
@@ -301,23 +301,35 @@ fn run_corpus(cli: &Cli, manifest: &PathBuf) -> Result<(), String> {
     );
 
     println!("\nrunning persistent AVL byte rope...");
-    let avl = run_corpus_backend(AvlRope::new(cli.leaf_bytes), &corpus)
-        .map_err(|e| e.to_string())?;
+    let avl = run_corpus_backend(
+        AvlRope::new(cli.leaf_bytes),
+        &corpus,
+        cli.config.verify_samples,
+    )
+    .map_err(|e| e.to_string())?;
     print_corpus_report(&avl.report);
 
     println!("\nrunning persistent COW piece rope...");
-    let cow = run_corpus_backend(PieceCow::new(cli.leaf_bytes), &corpus)
-        .map_err(|e| e.to_string())?;
+    let cow = run_corpus_backend(
+        PieceCow::new(cli.leaf_bytes),
+        &corpus,
+        cli.config.verify_samples,
+    )
+    .map_err(|e| e.to_string())?;
     print_corpus_report(&cow.report);
 
     println!("\nrunning incremental windowed CDC...");
-    let cdc = run_corpus_backend(CdcStore::new(cli.avg_chunk_bytes), &corpus)
-        .map_err(|e| e.to_string())?;
+    let cdc = run_corpus_backend(
+        CdcStore::new(cli.avg_chunk_bytes),
+        &corpus,
+        cli.config.verify_samples,
+    )
+    .map_err(|e| e.to_string())?;
     print_corpus_report(&cdc.report);
 
     println!("\nverifying sampled real children across all backends...");
-    verify_corpus_pair(&avl, &cow, &corpus, cli.config.verify_samples)?;
-    verify_corpus_pair(&cow, &cdc, &corpus, cli.config.verify_samples)?;
+    verify_corpus_outcomes(&avl, &cow, &corpus)?;
+    verify_corpus_outcomes(&cow, &cdc, &corpus)?;
     println!("semantic cross-check: PASS (3 backends)");
 
     println!("\ncomparison (left/right; lower is better; child growth excludes retained bases):");
