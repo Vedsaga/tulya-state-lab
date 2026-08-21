@@ -29,6 +29,7 @@ CONFIG = "default"
 SPLIT = "test"
 ROWS_URL = "https://datasets-server.huggingface.co/rows"
 PACK_MAGIC = b"TULYA_REPO_PACK_V1\0"
+PAGE_SIZE = 100
 
 
 def run(cmd: list[str], *, cwd: Path | None = None, capture: bool = False) -> subprocess.CompletedProcess:
@@ -64,7 +65,7 @@ def load_instances(offset: int, limit: int) -> list[dict]:
     rows: list[dict] = []
     cursor = offset
     while len(rows) < limit:
-        take = min(100, limit - len(rows))
+        take = min(PAGE_SIZE, limit - len(rows))
         batch = fetch_rows(cursor, take)
         if not batch:
             break
@@ -73,6 +74,55 @@ def load_instances(offset: int, limit: int) -> list[dict]:
         if len(batch) < take:
             break
     return rows
+
+
+def load_all_instances() -> list[dict]:
+    rows: list[dict] = []
+    cursor = 0
+    while True:
+        batch = fetch_rows(cursor, PAGE_SIZE)
+        if not batch:
+            break
+        rows.extend(batch)
+        cursor += len(batch)
+        if len(batch) < PAGE_SIZE:
+            break
+    return rows
+
+
+def repo_round_robin(rows: list[dict]) -> list[dict]:
+    """Interleave repositories while preserving dataset order within each repo."""
+    repo_order: list[str] = []
+    groups: dict[str, list[dict]] = {}
+    for row in rows:
+        repo = row["repo"]
+        if repo not in groups:
+            groups[repo] = []
+            repo_order.append(repo)
+        groups[repo].append(row)
+
+    selected: list[dict] = []
+    round_index = 0
+    while len(selected) < len(rows):
+        added = False
+        for repo in repo_order:
+            group = groups[repo]
+            if round_index < len(group):
+                selected.append(group[round_index])
+                added = True
+        if not added:
+            break
+        round_index += 1
+    return selected
+
+
+def select_instances(selection: str, offset: int, limit: int) -> list[dict]:
+    if selection == "sequential":
+        return load_instances(offset, limit)
+
+    all_rows = load_all_instances()
+    ordered = repo_round_robin(all_rows)
+    return ordered[offset : offset + limit]
 
 
 def safe_name(value: str) -> str:
@@ -223,6 +273,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", type=Path, default=Path("traces/swebench-verified"))
     parser.add_argument("--cache", type=Path, default=Path(".trace-cache/swebench-verified"))
+    parser.add_argument("--selection", choices=("sequential", "repo-round-robin"), default="sequential")
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--limit", type=int, default=20)
     args = parser.parse_args()
@@ -235,9 +286,16 @@ def main() -> int:
     args.out = args.out.resolve()
     args.cache = args.cache.resolve()
     args.out.mkdir(parents=True, exist_ok=True)
-    instances = load_instances(args.offset, args.limit)
+    instances = select_instances(args.selection, args.offset, args.limit)
     if len(instances) != args.limit:
         raise RuntimeError(f"requested {args.limit} rows but received {len(instances)}")
+
+    selected_repos = list(dict.fromkeys(instance["repo"] for instance in instances))
+    print(
+        f"selection={args.selection}, cases={len(instances)}, repositories={len(selected_repos)}",
+        flush=True,
+    )
+    print("repositories: " + ", ".join(selected_repos), flush=True)
 
     manifest_rows: list[tuple[str, str, str, str, str]] = []
     for index, instance in enumerate(instances, 1):
