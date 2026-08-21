@@ -1,8 +1,38 @@
 use crate::model::{Backend, BackendStats, Edit, StateError};
 use std::time::Instant;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkloadKind {
+    SmallEdit,
+    AppendHeavy,
+    CrossTemplate,
+    LargeRewrite,
+}
+
+impl WorkloadKind {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "small-edit" => Some(Self::SmallEdit),
+            "append-heavy" => Some(Self::AppendHeavy),
+            "cross-template" => Some(Self::CrossTemplate),
+            "large-rewrite" => Some(Self::LargeRewrite),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SmallEdit => "small-edit",
+            Self::AppendHeavy => "append-heavy",
+            Self::CrossTemplate => "cross-template",
+            Self::LargeRewrite => "large-rewrite",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
+    pub kind: WorkloadKind,
     pub branches: usize,
     pub base_bytes: usize,
     pub max_edit_bytes: usize,
@@ -14,6 +44,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            kind: WorkloadKind::SmallEdit,
             branches: 1_000,
             base_bytes: 2 * 1024 * 1024,
             max_edit_bytes: 96,
@@ -117,6 +148,54 @@ fn edit_payload(rng: &mut Rng, len: usize) -> Vec<u8> {
     out
 }
 
+fn template_payload(template_id: usize, len: usize) -> Vec<u8> {
+    const TEMPLATES: [&[u8]; 4] = [
+        br#"{"tool":"search","status":"ok","items":[{"kind":"result","score":0.91}],"trace":"shared-template-a"}\n"#,
+        br#"{"tool":"shell","status":"ok","stdout":"build completed successfully","trace":"shared-template-b"}\n"#,
+        br#"{"role":"assistant","content":"analysis checkpoint with repeated project context","trace":"shared-template-c"}\n"#,
+        br#"{"artifact":"generated-code","language":"rust","status":"candidate","trace":"shared-template-d"}\n"#,
+    ];
+    let template = TEMPLATES[template_id % TEMPLATES.len()];
+    let mut out = Vec::with_capacity(len);
+    while out.len() < len {
+        let take = (len - out.len()).min(template.len());
+        out.extend_from_slice(&template[..take]);
+    }
+    out
+}
+
+fn planned_read(rng: &mut Rng, child_len: usize, read_bytes: usize) -> (usize, usize) {
+    let read_len = read_bytes.min(child_len);
+    let read_start = if read_len == 0 {
+        0
+    } else {
+        rng.usize(child_len - read_len + 1)
+    };
+    (read_start, read_len)
+}
+
+fn push_op(
+    config: &Config,
+    rng: &mut Rng,
+    version_lengths: &mut Vec<usize>,
+    logical_version_bytes: &mut u128,
+    ops: &mut Vec<PlannedOp>,
+    parent: usize,
+    edit: Edit,
+) {
+    let parent_len = version_lengths[parent];
+    let child_len = edit.output_len(parent_len).expect("generated edit is valid");
+    let (read_start, read_len) = planned_read(rng, child_len, config.read_bytes);
+    ops.push(PlannedOp {
+        parent,
+        edit,
+        read_start,
+        read_len,
+    });
+    version_lengths.push(child_len);
+    *logical_version_bytes = logical_version_bytes.saturating_add(child_len as u128);
+}
+
 impl Workload {
     pub fn generate(config: Config) -> Self {
         let base = structured_base(config.base_bytes, config.seed);
@@ -125,44 +204,111 @@ impl Workload {
         version_lengths.push(base.len());
         let mut logical_version_bytes = base.len() as u128;
         let mut ops = Vec::with_capacity(config.branches);
-        let max_edit = config.max_edit_bytes.max(1);
+        let edit_scale = config.max_edit_bytes.max(1);
 
         for _ in 0..config.branches {
-            let parent = rng.usize(version_lengths.len());
-            let parent_len = version_lengths[parent];
-            let start = rng.usize(parent_len.saturating_add(1));
-            let available = parent_len - start;
-            let mode = rng.usize(10);
-
-            let (delete_len, insert_len) = match mode {
-                0..=5 => {
-                    let n = (1 + rng.usize(max_edit)).min(available);
-                    (n, n)
+            match config.kind {
+                WorkloadKind::SmallEdit => {
+                    let parent = rng.usize(version_lengths.len());
+                    let parent_len = version_lengths[parent];
+                    let start = rng.usize(parent_len.saturating_add(1));
+                    let available = parent_len - start;
+                    let mode = rng.usize(10);
+                    let (delete_len, insert_len) = match mode {
+                        0..=5 => {
+                            let n = (1 + rng.usize(edit_scale)).min(available);
+                            (n, n)
+                        }
+                        6..=7 => (0, 1 + rng.usize(edit_scale)),
+                        _ => ((1 + rng.usize(edit_scale)).min(available), 0),
+                    };
+                    let insert = edit_payload(&mut rng, insert_len);
+                    push_op(
+                        &config,
+                        &mut rng,
+                        &mut version_lengths,
+                        &mut logical_version_bytes,
+                        &mut ops,
+                        parent,
+                        Edit {
+                            start,
+                            delete_len,
+                            insert,
+                        },
+                    );
                 }
-                6..=7 => (0, 1 + rng.usize(max_edit)),
-                _ => ((1 + rng.usize(max_edit)).min(available), 0),
-            };
-            let insert = edit_payload(&mut rng, insert_len);
-            let edit = Edit {
-                start,
-                delete_len,
-                insert,
-            };
-            let child_len = edit.output_len(parent_len).expect("generated edit is valid");
-            let read_len = config.read_bytes.min(child_len);
-            let read_start = if read_len == 0 {
-                0
-            } else {
-                rng.usize(child_len - read_len + 1)
-            };
-            ops.push(PlannedOp {
-                parent,
-                edit,
-                read_start,
-                read_len,
-            });
-            version_lengths.push(child_len);
-            logical_version_bytes = logical_version_bytes.saturating_add(child_len as u128);
+                WorkloadKind::AppendHeavy => {
+                    let parent = if version_lengths.len() == 1 || rng.usize(4) != 0 {
+                        version_lengths.len() - 1
+                    } else {
+                        rng.usize(version_lengths.len())
+                    };
+                    let parent_len = version_lengths[parent];
+                    let insert_len = 1 + rng.usize(edit_scale);
+                    let insert = edit_payload(&mut rng, insert_len);
+                    push_op(
+                        &config,
+                        &mut rng,
+                        &mut version_lengths,
+                        &mut logical_version_bytes,
+                        &mut ops,
+                        parent,
+                        Edit {
+                            start: parent_len,
+                            delete_len: 0,
+                            insert,
+                        },
+                    );
+                }
+                WorkloadKind::CrossTemplate => {
+                    let parent = rng.usize(version_lengths.len());
+                    let parent_len = version_lengths[parent];
+                    let payload_len = edit_scale;
+                    let template_id = rng.usize(4);
+                    let insert = template_payload(template_id, payload_len);
+                    let start = rng.usize(parent_len.saturating_add(1));
+                    let available = parent_len - start;
+                    let delete_len = payload_len.min(available);
+                    push_op(
+                        &config,
+                        &mut rng,
+                        &mut version_lengths,
+                        &mut logical_version_bytes,
+                        &mut ops,
+                        parent,
+                        Edit {
+                            start,
+                            delete_len,
+                            insert,
+                        },
+                    );
+                }
+                WorkloadKind::LargeRewrite => {
+                    let parent = rng.usize(version_lengths.len());
+                    let parent_len = version_lengths[parent];
+                    let rewrite_len = edit_scale.min(parent_len.max(1));
+                    let start = if parent_len > rewrite_len {
+                        rng.usize(parent_len - rewrite_len + 1)
+                    } else {
+                        0
+                    };
+                    let delete_len = rewrite_len.min(parent_len.saturating_sub(start));
+                    let insert = edit_payload(&mut rng, edit_scale);
+                    push_op(
+                        &config,
+                        &mut rng,
+                        &mut version_lengths,
+                        &mut logical_version_bytes,
+                        &mut ops,
+                        parent,
+                        Edit {
+                            start,
+                            delete_len,
+                            insert,
+                        },
+                    );
+                }
+            }
         }
 
         Self {
@@ -295,17 +441,17 @@ pub fn verify_pair<A: Backend, B: Backend>(
 mod tests {
     use super::*;
 
-    #[test]
-    fn workload_parents_and_edits_are_valid() {
+    fn assert_valid_workload(kind: WorkloadKind, edit_bytes: usize) {
         let workload = Workload::generate(Config {
-            branches: 500,
+            kind,
+            branches: 200,
             base_bytes: 32 * 1024,
-            max_edit_bytes: 64,
+            max_edit_bytes: edit_bytes,
             read_bytes: 1024,
             verify_samples: 8,
             seed: 7,
         });
-        assert_eq!(workload.version_lengths.len(), 501);
+        assert_eq!(workload.version_lengths.len(), 201);
         for (i, op) in workload.ops.iter().enumerate() {
             assert!(op.parent <= i);
             op.edit
@@ -318,5 +464,33 @@ mod tests {
                 workload.version_lengths[i + 1]
             );
         }
+    }
+
+    #[test]
+    fn all_workload_families_generate_valid_edits() {
+        assert_valid_workload(WorkloadKind::SmallEdit, 64);
+        assert_valid_workload(WorkloadKind::AppendHeavy, 512);
+        assert_valid_workload(WorkloadKind::CrossTemplate, 4096);
+        assert_valid_workload(WorkloadKind::LargeRewrite, 4096);
+    }
+
+    #[test]
+    fn cross_template_reuses_a_small_payload_catalog() {
+        let workload = Workload::generate(Config {
+            kind: WorkloadKind::CrossTemplate,
+            branches: 32,
+            base_bytes: 8 * 1024,
+            max_edit_bytes: 2048,
+            read_bytes: 512,
+            verify_samples: 4,
+            seed: 11,
+        });
+        let unique: std::collections::HashSet<Vec<u8>> = workload
+            .ops
+            .iter()
+            .map(|op| op.edit.insert.clone())
+            .collect();
+        assert!(unique.len() <= 4);
+        assert!(unique.len() >= 2);
     }
 }
