@@ -147,7 +147,7 @@ def pack_worktree(worktree: Path, output: Path) -> None:
             else:
                 kind = 1
                 content = path.read_bytes()
-            out.write(struct.pack("<BIIIQ", kind, int(mode, 8), len(path_bytes), 0, len(content)))
+            out.write(struct.pack("<BIIQ", kind, int(mode, 8), len(path_bytes), len(content)))
             out.write(path_bytes)
             out.write(content)
 
@@ -232,6 +232,8 @@ def main() -> int:
     if args.offset < 0:
         parser.error("--offset must be non-negative")
 
+    args.out = args.out.resolve()
+    args.cache = args.cache.resolve()
     args.out.mkdir(parents=True, exist_ok=True)
     instances = load_instances(args.offset, args.limit)
     if len(instances) != args.limit:
